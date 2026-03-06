@@ -1,5 +1,3 @@
-require("dotenv").config();
-
 const fs = require("fs");
 const path = require("path");
 const TelegramBot = require("node-telegram-bot-api");
@@ -30,6 +28,10 @@ const RPC_URL = (process.env.RPC_URL || "").trim();
 const LIVE_STEP_BLOCKS = Number(process.env.LIVE_STEP_BLOCKS || 2500);
 const POLL_MS = Number(process.env.POLL_MS || 2000);
 const RPC_TIMEOUT_MS = Number(process.env.RPC_TIMEOUT_MS || 12000);
+
+// NOVO: blocos por dia reais da rede e limite máximo de atraso no live
+const BLOCKS_PER_DAY = Number(process.env.BLOCKS_PER_DAY || 345600);
+const LIVE_MAX_LAG_BLOCKS = Number(process.env.LIVE_MAX_LAG_BLOCKS || 40000000);
 
 const TOP_N = Number(process.env.TOP_N || 25);
 const FULL_ADDRESS = String(process.env.FULL_ADDRESS || "1") === "1";
@@ -117,7 +119,6 @@ function allowedChat(chatId) {
 }
 
 function send(chatId, text) {
-  // NÃO usar parse_mode (evita erro 400 de Markdown)
   return bot.sendMessage(chatId, text, { disable_web_page_preview: true }).catch(() => {});
 }
 
@@ -126,19 +127,10 @@ bot.on("polling_error", (err) => console.log("⚠️ polling_error:", err?.messa
 // =====================
 // Scanner state
 // =====================
-// stats[multKey] = {
-//   loss, wins, spins,
-//   lastSpinBlock,
-//   lastWinBlock,
-//   lastWinner,
-//   lastWagerRaw,
-//   lastPayoutRaw,
-//   lastJackpotRaw
-// }
 const stats = new Map();
 
 // startMap[requestId] = { multHundredths, wagerRaw, player, blockNumber }
-const startMap = new Map(); // insertion-ordered
+const startMap = new Map();
 
 let tokenInfo = { decimals: EVA_DECIMALS, symbol: EVA_SYMBOL, evaAddr: null };
 
@@ -159,8 +151,8 @@ const runtime = {
 
 // persist state
 let persisted = readJsonSafe(STATE_FILE, {
-  nextBlock: null, // where live should continue
-  lastHistTo: null, // last historical toBlock processed
+  nextBlock: null,
+  lastHistTo: null,
 });
 
 function getStat(multKey) {
@@ -185,7 +177,6 @@ function statsToPlainObject() {
   for (const [k, v] of stats.entries()) {
     obj[k] = {
       ...v,
-      // BigInt -> string p/ JSON
       lastWagerRaw: v.lastWagerRaw.toString(),
       lastPayoutRaw: v.lastPayoutRaw.toString(),
       lastJackpotRaw: v.lastJackpotRaw.toString(),
@@ -217,7 +208,6 @@ function persistAll() {
   writeJsonSafe(STATS_FILE, statsToPlainObject());
 }
 
-// Carrega stats antigos se RESUME=1
 if (RESUME) loadStatsFromDisk();
 
 // =====================
@@ -251,7 +241,6 @@ async function loadEvaTokenInfo() {
 
     tokenInfo = { decimals: Number(decimals), symbol: String(symbol || EVA_SYMBOL), evaAddr };
   } catch {
-    // mantém fallback
   }
 }
 
@@ -261,7 +250,6 @@ async function loadEvaTokenInfo() {
 let lastCallAt = 0;
 
 async function etherscanGetLogs({ fromBlock, toBlock, topic0, page, offset }) {
-  // rate-limit safe: no more than ~ (1000ms / MIN_CALL_INTERVAL_MS) calls/sec
   const wait = Math.max(0, MIN_CALL_INTERVAL_MS - (nowMs() - lastCallAt));
   if (wait > 0) await sleep(wait);
   lastCallAt = nowMs();
@@ -282,9 +270,6 @@ async function etherscanGetLogs({ fromBlock, toBlock, topic0, page, offset }) {
   const data = await res.json().catch(() => null);
   if (!data) throw new Error("Etherscan: resposta inválida");
 
-  // ok: { status:"1", message:"OK", result:[...] }
-  // no logs: status:"0", message:"No records found"
-  // errors: status:"0", message:"NOTOK", result:"..."
   if (data.message === "NOTOK") {
     throw new Error(`Etherscan error: NOTOK | ${data.result}`);
   }
@@ -319,7 +304,6 @@ function pruneStartMap(max = 120000) {
 }
 
 function onSpinStarted(logObj) {
-  // logObj = { topics, data, blockNumber, ... } from etherscan or RPC
   const parsed = iface.parseLog(logObj);
   const requestId = BigInt(parsed.args.requestId).toString();
   const multHundredths = BigInt(parsed.args.multiplierHundredths);
@@ -386,10 +370,10 @@ function renderConsole() {
   console.log("🎰 Scanner — Histórico via Etherscan V2 + Live via RPC\n");
   console.log(`📌 Contract: ${CONTRACT_ADDRESS}`);
   console.log(`⛓️  chainid: ${CHAIN_ID}`);
-  console.log(`🕒 DAYS_BACK: ${DAYS_BACK} | RESUME=${RESUME}`);
+  console.log(`🕒 DAYS_BACK: ${DAYS_BACK} | RESUME=${RESUME} | BLOCKS_PER_DAY=${BLOCKS_PER_DAY}`);
   console.log(`🧱 HIST_CHUNK_BLOCKS=${HIST_CHUNK_BLOCKS} | PAGE_SIZE=${PAGE_SIZE} | PAGE_DELAY_MS=${PAGE_DELAY_MS}ms | MIN_CALL_INTERVAL_MS=${MIN_CALL_INTERVAL_MS}ms`);
   console.log(`🌐 RPC (live): ${RPC_URL}`);
-  console.log(`🛰️ LIVE_STEP_BLOCKS=${LIVE_STEP_BLOCKS} | POLL_MS=${POLL_MS}ms | timeout=${RPC_TIMEOUT_MS}ms\n`);
+  console.log(`🛰️ LIVE_STEP_BLOCKS=${LIVE_STEP_BLOCKS} | POLL_MS=${POLL_MS}ms | timeout=${RPC_TIMEOUT_MS}ms | LIVE_MAX_LAG_BLOCKS=${LIVE_MAX_LAG_BLOCKS}\n`);
 
   console.log(`📍 Phase: ${runtime.phase}`);
   if (runtime.histFrom != null) console.log(`📚 HIST | from=${runtime.histFrom} to=${runtime.histTo} | latestRpc=${runtime.latestRpc} latestEs=${runtime.latestEs}`);
@@ -452,7 +436,6 @@ async function scanHistorical() {
 
   runtime.phase = "init-hist";
 
-  // latest from RPC and Etherscan
   const [latestRpc, latestEs] = await Promise.all([
     provider.getBlockNumber().catch(() => null),
     etherscanLatestBlock().catch(() => null),
@@ -466,23 +449,18 @@ async function scanHistorical() {
 
   const latestUse = Math.min(latestRpc, latestEs);
 
-  // Approx block per day for Arbitrum ~ (varia). A gente faz estimativa simples:
-  // 1 dia ~ 86400s; blocos ~ ~ 1-2s. Vamos usar 43200 blocos/dia (2s) como fallback.
-  const blocksPerDay = 43200;
-  const fromGuess = Math.max(0, latestUse - Math.floor(DAYS_BACK * blocksPerDay));
+  // NOVO: cálculo real por variável
+  const fromGuess = Math.max(0, latestUse - Math.floor(DAYS_BACK * BLOCKS_PER_DAY));
 
   let fromBlock = fromGuess;
 
-  // resume: se existir lastHistTo, continua dali
   if (RESUME && persisted.lastHistTo != null && Number(persisted.lastHistTo) > 0) {
     fromBlock = Number(persisted.lastHistTo) + 1;
   }
 
-  // também se existir nextBlock (live), não usar ele pro hist
   runtime.histFrom = fromBlock;
   runtime.histTo = latestUse;
 
-  // process in chunks
   let cur = fromBlock;
   while (cur <= latestUse) {
     const end = Math.min(latestUse, cur + HIST_CHUNK_BLOCKS - 1);
@@ -491,8 +469,6 @@ async function scanHistorical() {
     runtime.histTo = end;
     runtime.lastErr = null;
 
-    // Baixa SpinStarted e SpinResolved do intervalo (paginação)
-    // 1) started
     for (const which of ["started", "resolved"]) {
       const topic0 = which === "started" ? topicStarted : topicResolved;
 
@@ -510,15 +486,12 @@ async function scanHistorical() {
         } catch (e) {
           runtime.lastErr = e?.message || String(e);
           renderConsole();
-
-          // se rate-limit, espera e tenta de novo
           await sleep(1500);
           continue;
         }
 
         if (!Array.isArray(logs) || logs.length === 0) break;
 
-        // Normaliza para formato do parseLog
         for (const l of logs) {
           const logObj = {
             topics: l.topics,
@@ -534,16 +507,14 @@ async function scanHistorical() {
 
         renderConsole();
 
-        if (logs.length < PAGE_SIZE) break; // acabou
+        if (logs.length < PAGE_SIZE) break;
         page += 1;
 
         await sleep(PAGE_DELAY_MS);
       }
     }
 
-    // update persisted
     persisted.lastHistTo = end;
-    // se live ainda não setado, setar nextBlock para continuar
     if (!persisted.nextBlock) persisted.nextBlock = end + 1;
 
     persistAll();
@@ -560,13 +531,13 @@ async function scanLiveForever() {
   runtime.phase = "live";
   runtime.lastErr = null;
 
-  // define nextBlock
   const latest = await provider.getBlockNumber();
   runtime.latestRpc = latest;
 
   let next = persisted.nextBlock != null ? Number(persisted.nextBlock) : latest;
-  // se next estiver muito no passado, pelo menos começa do latest
-  if (next < latest - 5_000_000) next = latest;
+
+  // NOVO: não cortar agressivamente o atraso
+  if (next < latest - LIVE_MAX_LAG_BLOCKS) next = latest;
 
   while (true) {
     try {
@@ -583,7 +554,6 @@ async function scanLiveForever() {
       const to = Math.min(latestNow, next + LIVE_STEP_BLOCKS - 1);
       runtime.liveNext = next;
 
-      // pega started/resolved no range
       const [startedLogs, resolvedLogs] = await Promise.all([
         provider.getLogs({ address: CONTRACT_ADDRESS, fromBlock: next, toBlock: to, topics: [topicStarted] }).catch(() => []),
         provider.getLogs({ address: CONTRACT_ADDRESS, fromBlock: next, toBlock: to, topics: [topicResolved] }).catch(() => []),
@@ -611,7 +581,7 @@ async function scanLiveForever() {
 }
 
 // =====================
-// Telegram commands (reads current in-memory stats)
+// Telegram commands
 // =====================
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
@@ -693,14 +663,11 @@ bot.onText(/\/m (.+)/, (msg, match) => {
     return;
   }
 
-  // normaliza: se o user passar "1.4" vira "1.40x" aproximado
   let key = query.toLowerCase().includes("x") ? query : (query + "x");
-  // tenta achar match exato, senão tenta achar pelo prefixo numérico
   let foundKey = null;
 
   if (stats.has(key)) foundKey = key;
   else {
-    // tenta por comparação numérica
     const qn = Number(key.replace("x", "").trim());
     if (Number.isFinite(qn)) {
       let best = null;
@@ -714,7 +681,7 @@ bot.onText(/\/m (.+)/, (msg, match) => {
           best = k;
         }
       }
-      if (best != null && bestDiff <= 0.05) foundKey = best; // tolerância
+      if (best != null && bestDiff <= 0.05) foundKey = best;
     }
   }
 
@@ -756,7 +723,6 @@ bot.onText(/\/m (.+)/, (msg, match) => {
   await loadEvaTokenInfo();
   renderConsole();
 
-  // HIST primeiro (se tiver key), depois LIVE
   if (ETHERSCAN_API_KEY) {
     try {
       await scanHistorical();
@@ -765,13 +731,11 @@ bot.onText(/\/m (.+)/, (msg, match) => {
       console.log("⚠️ HIST falhou, indo pro LIVE:", runtime.lastErr);
     }
   } else {
-    // sem histórico: começa live do latest
     persisted.nextBlock = null;
     persisted.lastHistTo = null;
     persistAll();
   }
 
-  // Ajuste: se terminou hist, nextBlock já está setado
   await scanLiveForever();
 })().catch((e) => {
   console.error("❌ Scanner erro fatal:", e?.message || e);
