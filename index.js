@@ -15,21 +15,17 @@ const TELEGRAM_ALLOWED_CHAT_IDS = (process.env.TELEGRAM_ALLOWED_CHAT_IDS || "")
 const CHAIN_ID = Number(process.env.CHAIN_ID || 42161);
 const CONTRACT_ADDRESS = (process.env.CONTRACT_ADDRESS || "").trim();
 
-const ETHERSCAN_API_KEY = (process.env.ETHERSCAN_API_KEY || "").trim();
 const DAYS_BACK = Number(process.env.DAYS_BACK || 7);
 const RESUME = Number(process.env.RESUME || 1);
 
-const HIST_CHUNK_BLOCKS = Number(process.env.HIST_CHUNK_BLOCKS || 25000);
-const PAGE_SIZE = Number(process.env.PAGE_SIZE || 1000);
-const MIN_CALL_INTERVAL_MS = Number(process.env.MIN_CALL_INTERVAL_MS || 450);
-const PAGE_DELAY_MS = Number(process.env.PAGE_DELAY_MS || 600);
+const HIST_CHUNK_BLOCKS = Number(process.env.HIST_CHUNK_BLOCKS || 4000);
+const HIST_RETRY_DELAY_MS = Number(process.env.HIST_RETRY_DELAY_MS || 3000);
 
 const RPC_URL = (process.env.RPC_URL || "").trim();
 const LIVE_STEP_BLOCKS = Number(process.env.LIVE_STEP_BLOCKS || 2500);
 const POLL_MS = Number(process.env.POLL_MS || 2000);
-const RPC_TIMEOUT_MS = Number(process.env.RPC_TIMEOUT_MS || 12000);
+const RPC_TIMEOUT_MS = Number(process.env.RPC_TIMEOUT_MS || 20000);
 
-// NOVO: blocos por dia reais da rede e limite máximo de atraso no live
 const BLOCKS_PER_DAY = Number(process.env.BLOCKS_PER_DAY || 345600);
 const LIVE_MAX_LAG_BLOCKS = Number(process.env.LIVE_MAX_LAG_BLOCKS || 40000000);
 
@@ -46,7 +42,7 @@ const STATE_FILE = path.join(process.cwd(), "state.json");
 const STATS_FILE = path.join(process.cwd(), "stats.json");
 
 // =====================
-// ABI (minimal events only)
+// ABI
 // =====================
 const ROULETTE_EVENTS_ABI = [
   "event SpinStarted(uint256 indexed requestId, address indexed player, uint256 wager, uint256 netStake, uint256 multiplierHundredths, uint256 maxPayout, uint256 jackpotContribution, uint32 configIndex, bool participatingInJackpot)",
@@ -54,7 +50,6 @@ const ROULETTE_EVENTS_ABI = [
   "function evaToken() view returns (address)",
 ];
 
-// ERC20 minimal for decimals/symbol
 const ERC20_MIN_ABI = [
   "function decimals() view returns (uint8)",
   "function symbol() view returns (string)",
@@ -69,9 +64,6 @@ function die(msg) {
 }
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
-}
-function nowMs() {
-  return Date.now();
 }
 function fmtAddr(a) {
   if (!a) return "-";
@@ -94,7 +86,6 @@ function fmtUnits(raw, decimals, symbol) {
     return `${String(raw)} ${symbol}`;
   }
 }
-
 function readJsonSafe(file, fallback) {
   try {
     if (!fs.existsSync(file)) return fallback;
@@ -117,29 +108,23 @@ function allowedChat(chatId) {
   if (!TELEGRAM_ALLOWED_CHAT_IDS.length) return true;
   return TELEGRAM_ALLOWED_CHAT_IDS.includes(String(chatId));
 }
-
 function send(chatId, text) {
   return bot.sendMessage(chatId, text, { disable_web_page_preview: true }).catch(() => {});
 }
-
 bot.on("polling_error", (err) => console.log("⚠️ polling_error:", err?.message || err));
 
 // =====================
 // Scanner state
 // =====================
 const stats = new Map();
-
-// startMap[requestId] = { multHundredths, wagerRaw, player, blockNumber }
 const startMap = new Map();
 
 let tokenInfo = { decimals: EVA_DECIMALS, symbol: EVA_SYMBOL, evaAddr: null };
 
-// runtime counters
 const runtime = {
   startedLogs: 0,
   resolvedLogs: 0,
   matched: 0,
-  lastRender: 0,
   phase: "init",
   histFrom: null,
   histTo: null,
@@ -149,11 +134,15 @@ const runtime = {
   lastErr: null,
 };
 
-// persist state
 let persisted = readJsonSafe(STATE_FILE, {
   nextBlock: null,
   lastHistTo: null,
 });
+
+if (RESUME === 0) {
+  persisted.nextBlock = null;
+  persisted.lastHistTo = null;
+}
 
 function getStat(multKey) {
   if (!stats.has(multKey)) {
@@ -215,7 +204,6 @@ if (RESUME) loadStatsFromDisk();
 // =====================
 if (!RPC_URL) die("Faltou RPC_URL no .env");
 if (!CONTRACT_ADDRESS) die("Faltou CONTRACT_ADDRESS no .env");
-if (!ETHERSCAN_API_KEY) console.log("⚠️ Sem ETHERSCAN_API_KEY: histórico não vai rodar, só live via RPC.");
 
 const provider = new ethers.JsonRpcProvider(
   RPC_URL,
@@ -240,63 +228,13 @@ async function loadEvaTokenInfo() {
     ]);
 
     tokenInfo = { decimals: Number(decimals), symbol: String(symbol || EVA_SYMBOL), evaAddr };
-  } catch {
-  }
-}
-
-// =====================
-// Etherscan V2 (Logs)
-// =====================
-let lastCallAt = 0;
-
-async function etherscanGetLogs({ fromBlock, toBlock, topic0, page, offset }) {
-  const wait = Math.max(0, MIN_CALL_INTERVAL_MS - (nowMs() - lastCallAt));
-  if (wait > 0) await sleep(wait);
-  lastCallAt = nowMs();
-
-  const url = new URL("https://api.etherscan.io/v2/api");
-  url.searchParams.set("chainid", String(CHAIN_ID));
-  url.searchParams.set("module", "logs");
-  url.searchParams.set("action", "getLogs");
-  url.searchParams.set("fromBlock", String(fromBlock));
-  url.searchParams.set("toBlock", String(toBlock));
-  url.searchParams.set("address", CONTRACT_ADDRESS);
-  url.searchParams.set("topic0", topic0);
-  url.searchParams.set("page", String(page));
-  url.searchParams.set("offset", String(offset));
-  url.searchParams.set("apikey", ETHERSCAN_API_KEY);
-
-  const res = await fetch(url.toString());
-  const data = await res.json().catch(() => null);
-  if (!data) throw new Error("Etherscan: resposta inválida");
-
-  if (data.message === "NOTOK") {
-    throw new Error(`Etherscan error: NOTOK | ${data.result}`);
-  }
-  return data.result || [];
-}
-
-async function etherscanLatestBlock() {
-  const url = new URL("https://api.etherscan.io/v2/api");
-  url.searchParams.set("chainid", String(CHAIN_ID));
-  url.searchParams.set("module", "proxy");
-  url.searchParams.set("action", "eth_blockNumber");
-  url.searchParams.set("apikey", ETHERSCAN_API_KEY);
-
-  const wait = Math.max(0, MIN_CALL_INTERVAL_MS - (nowMs() - lastCallAt));
-  if (wait > 0) await sleep(wait);
-  lastCallAt = nowMs();
-
-  const res = await fetch(url.toString());
-  const data = await res.json().catch(() => null);
-  if (!data?.result) throw new Error("Etherscan latest block inválido");
-  return Number(BigInt(data.result));
+  } catch {}
 }
 
 // =====================
 // Core processing
 // =====================
-function pruneStartMap(max = 120000) {
+function pruneStartMap(max = 200000) {
   while (startMap.size > max) {
     const firstKey = startMap.keys().next().value;
     startMap.delete(firstKey);
@@ -344,7 +282,6 @@ function onSpinResolved(logObj) {
   if (isWin) {
     s.wins += 1;
     s.loss = 0;
-
     s.lastWinBlock = block;
     s.lastWinner = player || st.player || null;
     s.lastWagerRaw = st.wagerRaw || 0n;
@@ -367,21 +304,25 @@ function renderConsole() {
   const rows = topLossRows(TOP_N);
 
   console.clear();
-  console.log("🎰 Scanner — Histórico via Etherscan V2 + Live via RPC\n");
+  console.log("🎰 Scanner — Histórico via RPC + Live via RPC\n");
   console.log(`📌 Contract: ${CONTRACT_ADDRESS}`);
   console.log(`⛓️  chainid: ${CHAIN_ID}`);
   console.log(`🕒 DAYS_BACK: ${DAYS_BACK} | RESUME=${RESUME} | BLOCKS_PER_DAY=${BLOCKS_PER_DAY}`);
-  console.log(`🧱 HIST_CHUNK_BLOCKS=${HIST_CHUNK_BLOCKS} | PAGE_SIZE=${PAGE_SIZE} | PAGE_DELAY_MS=${PAGE_DELAY_MS}ms | MIN_CALL_INTERVAL_MS=${MIN_CALL_INTERVAL_MS}ms`);
-  console.log(`🌐 RPC (live): ${RPC_URL}`);
+  console.log(`🧱 HIST_CHUNK_BLOCKS=${HIST_CHUNK_BLOCKS} | HIST_RETRY_DELAY_MS=${HIST_RETRY_DELAY_MS}ms`);
+  console.log(`🌐 RPC: ${RPC_URL}`);
   console.log(`🛰️ LIVE_STEP_BLOCKS=${LIVE_STEP_BLOCKS} | POLL_MS=${POLL_MS}ms | timeout=${RPC_TIMEOUT_MS}ms | LIVE_MAX_LAG_BLOCKS=${LIVE_MAX_LAG_BLOCKS}\n`);
 
   console.log(`📍 Phase: ${runtime.phase}`);
-  if (runtime.histFrom != null) console.log(`📚 HIST | from=${runtime.histFrom} to=${runtime.histTo} | latestRpc=${runtime.latestRpc} latestEs=${runtime.latestEs}`);
-  if (runtime.liveNext != null) console.log(`🌐 LIVE | nextBlock=${runtime.liveNext} latestRpc=${runtime.latestRpc}`);
+  if (runtime.histFrom != null) {
+    console.log(`📚 HIST | from=${runtime.histFrom} to=${runtime.histTo} | latestRpc=${runtime.latestRpc} latestEs=${runtime.latestEs}`);
+  }
+  if (runtime.liveNext != null) {
+    console.log(`🌐 LIVE | nextBlock=${runtime.liveNext} latestRpc=${runtime.latestRpc}`);
+  }
   console.log(`ℹ️ logs: started=${runtime.startedLogs} | resolved=${runtime.resolvedLogs} | matched=${runtime.matched} | startMap=${startMap.size}`);
   if (runtime.lastErr) console.log(`⚠️ lastErr: ${runtime.lastErr}`);
-
   console.log("");
+
   console.log(
     [
       "MULT".padEnd(10),
@@ -396,7 +337,7 @@ function renderConsole() {
       "ULT_SPIN".padStart(10),
     ].join(" | ")
   );
-  console.log("-".repeat(10 + 6 + 6 + 7 + 10 + 46 + 14 + 14 + 14 + 10 + 9 * 3));
+  console.log("-".repeat(170));
 
   if (!rows.length) {
     console.log("(sem dados ainda)");
@@ -429,103 +370,77 @@ function renderConsole() {
 }
 
 // =====================
-// Historical scan (Etherscan V2 logs)
+// RPC log readers
+// =====================
+async function getLogsSafe(fromBlock, toBlock, topic0) {
+  return provider.getLogs({
+    address: CONTRACT_ADDRESS,
+    fromBlock,
+    toBlock,
+    topics: [topic0],
+  });
+}
+
+// =====================
+// Historical scan (RPC)
 // =====================
 async function scanHistorical() {
-  if (!ETHERSCAN_API_KEY) return;
-
   runtime.phase = "init-hist";
+  runtime.lastErr = null;
 
-  const [latestRpc, latestEs] = await Promise.all([
-    provider.getBlockNumber().catch(() => null),
-    etherscanLatestBlock().catch(() => null),
-  ]);
-
-  if (latestRpc == null) throw new Error("RPC getBlockNumber falhou");
-  if (latestEs == null) throw new Error("Etherscan latest block falhou");
-
+  const latestRpc = await provider.getBlockNumber();
   runtime.latestRpc = latestRpc;
-  runtime.latestEs = latestEs;
+  runtime.latestEs = latestRpc;
 
-  const latestUse = Math.min(latestRpc, latestEs);
-
-  // NOVO: cálculo real por variável
+  const latestUse = latestRpc;
   const fromGuess = Math.max(0, latestUse - Math.floor(DAYS_BACK * BLOCKS_PER_DAY));
 
   let fromBlock = fromGuess;
-
   if (RESUME && persisted.lastHistTo != null && Number(persisted.lastHistTo) > 0) {
     fromBlock = Number(persisted.lastHistTo) + 1;
   }
 
-  runtime.histFrom = fromBlock;
-  runtime.histTo = latestUse;
-
   let cur = fromBlock;
+
   while (cur <= latestUse) {
     const end = Math.min(latestUse, cur + HIST_CHUNK_BLOCKS - 1);
+
     runtime.phase = "hist";
     runtime.histFrom = cur;
     runtime.histTo = end;
+    runtime.latestRpc = await provider.getBlockNumber().catch(() => runtime.latestRpc);
+    runtime.latestEs = runtime.latestRpc;
     runtime.lastErr = null;
 
-    for (const which of ["started", "resolved"]) {
-      const topic0 = which === "started" ? topicStarted : topicResolved;
+    try {
+      const [startedLogs, resolvedLogs] = await Promise.all([
+        getLogsSafe(cur, end, topicStarted),
+        getLogsSafe(cur, end, topicResolved),
+      ]);
 
-      let page = 1;
-      while (true) {
-        let logs;
-        try {
-          logs = await etherscanGetLogs({
-            fromBlock: cur,
-            toBlock: end,
-            topic0,
-            page,
-            offset: PAGE_SIZE,
-          });
-        } catch (e) {
-          runtime.lastErr = e?.message || String(e);
-          renderConsole();
-          await sleep(1500);
-          continue;
-        }
-
-        if (!Array.isArray(logs) || logs.length === 0) break;
-
-        for (const l of logs) {
-          const logObj = {
-            topics: l.topics,
-            data: l.data,
-            blockNumber: Number(l.blockNumber),
-          };
-
-          try {
-            if (which === "started") onSpinStarted(logObj);
-            else onSpinResolved(logObj);
-          } catch {}
-        }
-
-        renderConsole();
-
-        if (logs.length < PAGE_SIZE) break;
-        page += 1;
-
-        await sleep(PAGE_DELAY_MS);
+      for (const log of startedLogs) {
+        try { onSpinStarted(log); } catch {}
       }
+      for (const log of resolvedLogs) {
+        try { onSpinResolved(log); } catch {}
+      }
+
+      persisted.lastHistTo = end;
+      persisted.nextBlock = end + 1;
+      persistAll();
+
+      renderConsole();
+      cur = end + 1;
+    } catch (e) {
+      runtime.lastErr = e?.shortMessage || e?.message || String(e);
+      renderConsole();
+      await sleep(HIST_RETRY_DELAY_MS);
     }
-
-    persisted.lastHistTo = end;
-    if (!persisted.nextBlock) persisted.nextBlock = end + 1;
-
-    persistAll();
-    renderConsole();
-
-    cur = end + 1;
   }
 }
 
 // =====================
-// Live scan (RPC getLogs)
+// Live scan (RPC)
 // =====================
 async function scanLiveForever() {
   runtime.phase = "live";
@@ -533,16 +448,16 @@ async function scanLiveForever() {
 
   const latest = await provider.getBlockNumber();
   runtime.latestRpc = latest;
+  runtime.latestEs = latest;
 
   let next = persisted.nextBlock != null ? Number(persisted.nextBlock) : latest;
-
-  // NOVO: não cortar agressivamente o atraso
   if (next < latest - LIVE_MAX_LAG_BLOCKS) next = latest;
 
   while (true) {
     try {
       const latestNow = await provider.getBlockNumber();
       runtime.latestRpc = latestNow;
+      runtime.latestEs = latestNow;
 
       if (next > latestNow) {
         runtime.liveNext = next;
@@ -555,8 +470,8 @@ async function scanLiveForever() {
       runtime.liveNext = next;
 
       const [startedLogs, resolvedLogs] = await Promise.all([
-        provider.getLogs({ address: CONTRACT_ADDRESS, fromBlock: next, toBlock: to, topics: [topicStarted] }).catch(() => []),
-        provider.getLogs({ address: CONTRACT_ADDRESS, fromBlock: next, toBlock: to, topics: [topicResolved] }).catch(() => []),
+        getLogsSafe(next, to, topicStarted).catch(() => []),
+        getLogsSafe(next, to, topicResolved).catch(() => []),
       ]);
 
       for (const log of startedLogs) {
@@ -636,7 +551,6 @@ bot.onText(/\/top/, (msg) => {
   if (!allowedChat(chatId)) return;
 
   const rows = topLossRows(TOP_N);
-
   if (!rows.length) {
     send(chatId, "Sem dados ainda. O scanner está carregando histórico.");
     return;
@@ -723,19 +637,8 @@ bot.onText(/\/m (.+)/, (msg, match) => {
   await loadEvaTokenInfo();
   renderConsole();
 
-  if (ETHERSCAN_API_KEY) {
-    try {
-      await scanHistorical();
-    } catch (e) {
-      runtime.lastErr = e?.message || String(e);
-      console.log("⚠️ HIST falhou, indo pro LIVE:", runtime.lastErr);
-    }
-  } else {
-    persisted.nextBlock = null;
-    persisted.lastHistTo = null;
-    persistAll();
-  }
-
+  // histórico completo primeiro; só depois entra no live
+  await scanHistorical();
   await scanLiveForever();
 })().catch((e) => {
   console.error("❌ Scanner erro fatal:", e?.message || e);
