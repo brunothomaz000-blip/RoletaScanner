@@ -15,7 +15,7 @@ const TELEGRAM_ALLOWED_CHAT_IDS = (process.env.TELEGRAM_ALLOWED_CHAT_IDS || "")
 const CHAIN_ID = Number(process.env.CHAIN_ID || 42161);
 const CONTRACT_ADDRESS = (process.env.CONTRACT_ADDRESS || "").trim();
 
-const DAYS_BACK = Number(process.env.DAYS_BACK || 7);
+const DAYS_BACK = Number(process.env.DAYS_BACK || 7); // para 3 meses: DAYS_BACK=90 no .env
 const RESUME = Number(process.env.RESUME || 1);
 
 const HIST_CHUNK_BLOCKS = Number(process.env.HIST_CHUNK_BLOCKS || 4000);
@@ -73,7 +73,7 @@ function fmtAddr(a) {
 function fmtMult(hundredths) {
   const n = Number(hundredths);
   const x = n / 100;
-  const s = x.toFixed(2).replace(/\.00$/, "");
+  const s = x.toFixed(2).replace(/\.00$/, "").replace(/(\.\d*[1-9])0$/, "$1");
   return s + "x";
 }
 function fmtUnits(raw, decimals, symbol) {
@@ -96,6 +96,49 @@ function readJsonSafe(file, fallback) {
 }
 function writeJsonSafe(file, obj) {
   fs.writeFileSync(file, JSON.stringify(obj, null, 2));
+}
+function safeNum(v, fallback = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+function multKeyToNumber(multKey) {
+  return safeNum(String(multKey).toLowerCase().replace("x", "").trim(), NaN);
+}
+function theoreticalWinChance(multKey) {
+  const m = multKeyToNumber(multKey);
+  if (!Number.isFinite(m) || m <= 0) return null;
+  return 1 / m;
+}
+function expectedLossBeforeWin(multKey) {
+  const p = theoreticalWinChance(multKey);
+  if (!p || p <= 0) return null;
+  return (1 / p) - 1;
+}
+function varianceScore(multKey, loss) {
+  const expLoss = expectedLossBeforeWin(multKey);
+  if (!Number.isFinite(expLoss) || expLoss <= 0) return null;
+  return loss / expLoss;
+}
+function fmtPct(p) {
+  if (p == null || !Number.isFinite(p)) return "-";
+  return `${(p * 100).toFixed(2)}%`;
+}
+function fmtScore(score) {
+  if (score == null || !Number.isFinite(score)) return "-";
+  return `${score.toFixed(2)}x`;
+}
+function varianceStatus(score) {
+  if (score == null || !Number.isFinite(score)) return "sem base";
+  if (score < 0.8) return "abaixo do esperado";
+  if (score < 1.2) return "normal";
+  if (score < 1.6) return "atrasado";
+  if (score < 2.2) return "muito atrasado";
+  return "extremo";
+}
+function normalizeMultInput(query) {
+  const raw = String(query || "").trim().toLowerCase().replace(",", ".");
+  if (!raw) return "";
+  return raw.includes("x") ? raw : raw + "x";
 }
 
 // =====================
@@ -294,14 +337,113 @@ function onSpinResolved(logObj) {
   runtime.matched += 1;
 }
 
-function topLossRows(n = TOP_N) {
+function rowsByLoss(n = TOP_N) {
   const arr = [...stats.entries()].map(([mult, v]) => ({ mult, ...v }));
   arr.sort((a, b) => (b.loss - a.loss) || (b.spins - a.spins));
   return arr.slice(0, n);
 }
 
+function rowsByVarianceDesc(n = TOP_N) {
+  const arr = [...stats.entries()]
+    .map(([mult, v]) => {
+      const expLoss = expectedLossBeforeWin(mult);
+      const score = varianceScore(mult, v.loss);
+      return { mult, ...v, expLoss, score };
+    })
+    .filter((r) => r.expLoss != null && Number.isFinite(r.expLoss))
+    .sort((a, b) => {
+      const as = a.score ?? -Infinity;
+      const bs = b.score ?? -Infinity;
+      return (bs - as) || (b.loss - a.loss) || (b.spins - a.spins);
+    });
+
+  return arr.slice(0, n);
+}
+
+function rowsByVarianceAsc(n = TOP_N) {
+  const arr = [...stats.entries()]
+    .map(([mult, v]) => {
+      const expLoss = expectedLossBeforeWin(mult);
+      const score = varianceScore(mult, v.loss);
+      return { mult, ...v, expLoss, score };
+    })
+    .filter((r) => r.expLoss != null && Number.isFinite(r.expLoss))
+    .sort((a, b) => {
+      const as = a.score ?? Infinity;
+      const bs = b.score ?? Infinity;
+      return (as - bs) || (a.loss - b.loss) || (b.spins - a.spins);
+    });
+
+  return arr.slice(0, n);
+}
+
+function latestWinsRows(n = 10) {
+  const arr = [...stats.entries()]
+    .map(([mult, v]) => ({ mult, ...v }))
+    .filter((r) => r.lastWinBlock != null)
+    .sort((a, b) => (b.lastWinBlock - a.lastWinBlock));
+
+  return arr.slice(0, n);
+}
+
+function findMultiplierKey(query) {
+  const key = normalizeMultInput(query);
+  if (!key) return null;
+  if (stats.has(key)) return key;
+
+  const qn = multKeyToNumber(key);
+  if (!Number.isFinite(qn)) return null;
+
+  let best = null;
+  let bestDiff = Infinity;
+
+  for (const k of stats.keys()) {
+    const kn = multKeyToNumber(k);
+    if (!Number.isFinite(kn)) continue;
+    const diff = Math.abs(kn - qn);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = k;
+    }
+  }
+
+  if (best != null && bestDiff <= 0.05) return best;
+  return null;
+}
+
+function buildMultiplierDetails(foundKey) {
+  const s = stats.get(foundKey);
+  const chance = theoreticalWinChance(foundKey);
+  const expLoss = expectedLossBeforeWin(foundKey);
+  const score = varianceScore(foundKey, s.loss);
+
+  const wager = s.lastWinBlock == null ? "-" : fmtUnits(s.lastWagerRaw, tokenInfo.decimals, tokenInfo.symbol);
+  const payout = s.lastWinBlock == null ? "-" : fmtUnits(s.lastPayoutRaw, tokenInfo.decimals, tokenInfo.symbol);
+  const jackpot = s.lastWinBlock == null ? "-" : fmtUnits(s.lastJackpotRaw, tokenInfo.decimals, tokenInfo.symbol);
+
+  return [
+    `🎯 ${foundKey}`,
+    "",
+    `📉 LOSS atuais: ${s.loss}`,
+    `🎰 SPINS: ${s.spins}`,
+    `🏆 WINS: ${s.wins}`,
+    "",
+    `📊 Chance teórica: ${fmtPct(chance)}`,
+    `📏 LOSS esperado: ${expLoss == null ? "-" : expLoss.toFixed(2)}`,
+    `📈 Score variância: ${fmtScore(score)}`,
+    `🚦 Status: ${varianceStatus(score)}`,
+    "",
+    `🧱 Último WIN: ${s.lastWinBlock == null ? "-" : s.lastWinBlock}`,
+    `👤 Último ganhador: ${s.lastWinner ? fmtAddr(s.lastWinner) : "-"}`,
+    `💸 Wager: ${wager}`,
+    `💰 Payout: ${payout}`,
+    `🎁 Jackpot: ${jackpot}`,
+    `🧱 Último spin: ${s.lastSpinBlock || "-"}`,
+  ].join("\n");
+}
+
 function renderConsole() {
-  const rows = topLossRows(TOP_N);
+  const rows = rowsByVarianceDesc(TOP_N);
 
   console.clear();
   console.log("🎰 Scanner — Histórico via RPC + Live via RPC\n");
@@ -327,17 +469,18 @@ function renderConsole() {
     [
       "MULT".padEnd(10),
       "LOSS".padStart(6),
+      "ESP".padStart(8),
+      "SCORE".padStart(8),
       "WINS".padStart(6),
       "SPINS".padStart(7),
       "ULT_WIN".padStart(10),
       "ULT_GANHADOR".padEnd(46),
       "WAGER".padStart(14),
       "PAYOUT".padStart(14),
-      "JACKPOT".padStart(14),
       "ULT_SPIN".padStart(10),
     ].join(" | ")
   );
-  console.log("-".repeat(170));
+  console.log("-".repeat(165));
 
   if (!rows.length) {
     console.log("(sem dados ainda)");
@@ -347,22 +490,21 @@ function renderConsole() {
   for (const r of rows) {
     const ultWin = r.lastWinBlock == null ? "-" : String(r.lastWinBlock);
     const winner = r.lastWinner ? fmtAddr(r.lastWinner).padEnd(46) : "-".padEnd(46);
-
     const wager = r.lastWinBlock == null ? "-" : fmtUnits(r.lastWagerRaw, tokenInfo.decimals, tokenInfo.symbol);
     const payout = r.lastWinBlock == null ? "-" : fmtUnits(r.lastPayoutRaw, tokenInfo.decimals, tokenInfo.symbol);
-    const jackpot = r.lastWinBlock == null ? "-" : fmtUnits(r.lastJackpotRaw, tokenInfo.decimals, tokenInfo.symbol);
 
     console.log(
       [
         r.mult.padEnd(10),
         String(r.loss).padStart(6),
+        String(r.expLoss == null ? "-" : r.expLoss.toFixed(1)).padStart(8),
+        String(fmtScore(r.score)).padStart(8),
         String(r.wins).padStart(6),
         String(r.spins).padStart(7),
         ultWin.padStart(10),
         winner,
         String(wager).padStart(14),
         String(payout).padStart(14),
-        String(jackpot).padStart(14),
         String(r.lastSpinBlock || "-").padStart(10),
       ].join(" | ")
     );
@@ -511,12 +653,20 @@ bot.onText(/\/help/, (msg) => {
   send(
     chatId,
     [
-      "🤖 Comandos",
+      "🤖 COMANDOS DO SCANNER",
       "",
-      "/top — top LOSS seguidos por multiplicador",
-      "/m 100x — detalhes de um multiplicador (ex: /m 1.40x, /m 100x)",
-      "/health — status do scanner",
-      "/chatid — mostra seu chat id",
+      "📊 /top      → top mais esticados pela variância",
+      "📈 /rank     → ranking completo por variância",
+      "🔥 /hot      → os mais atrasados agora",
+      "🧊 /cold     → os menos atrasados agora",
+      "🎯 /m 66.45  → detalhes de um multiplicador",
+      "⚖️ /compare 30 66.45 → compara dois multiplicadores",
+      "🏆 /win      → últimos wins detectados",
+      "📦 /stats    → resumo geral",
+      "🩺 /scan     → saúde do scanner",
+      "🆔 /chatid   → mostra seu chat id",
+      "",
+      "Obs: o ranking usa atraso vs esperado pela variância.",
     ].join("\n")
   );
 });
@@ -546,85 +696,234 @@ bot.onText(/\/health/, (msg) => {
   );
 });
 
+bot.onText(/\/scan/, (msg) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+
+  send(
+    chatId,
+    [
+      "🛰️ SCANNER",
+      "",
+      `Fase: ${runtime.phase}`,
+      `Último bloco RPC: ${runtime.latestRpc ?? "-"}`,
+      `Próximo bloco LIVE: ${runtime.liveNext ?? persisted.nextBlock ?? "-"}`,
+      `Histórico: ${runtime.histFrom ?? "-"} → ${runtime.histTo ?? "-"}`,
+      `SpinStarted lidos: ${runtime.startedLogs}`,
+      `SpinResolved lidos: ${runtime.resolvedLogs}`,
+      `Pares casados: ${runtime.matched}`,
+      `startMap: ${startMap.size}`,
+      runtime.lastErr ? `Erro recente: ${runtime.lastErr}` : "Erro recente: -",
+    ].join("\n")
+  );
+});
+
+bot.onText(/\/stats/, (msg) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+
+  const rows = [...stats.entries()].map(([mult, v]) => ({ mult, ...v }));
+  if (!rows.length) {
+    send(chatId, "Sem dados ainda. O scanner está carregando histórico.");
+    return;
+  }
+
+  const totalMultipliers = rows.length;
+  const totalSpins = rows.reduce((a, b) => a + b.spins, 0);
+  const totalWins = rows.reduce((a, b) => a + b.wins, 0);
+  const totalCurrentLoss = rows.reduce((a, b) => a + b.loss, 0);
+
+  const hottest = rowsByVarianceDesc(1)[0];
+  const coldest = rowsByVarianceAsc(1)[0];
+  const latestWin = latestWinsRows(1)[0];
+
+  send(
+    chatId,
+    [
+      "📦 RESUMO GERAL",
+      "",
+      `Multiplicadores monitorados: ${totalMultipliers}`,
+      `Spins contados: ${totalSpins}`,
+      `Wins contados: ${totalWins}`,
+      `Loss atuais somados: ${totalCurrentLoss}`,
+      "",
+      `🔥 Mais esticado: ${hottest ? `${hottest.mult} (${fmtScore(hottest.score)})` : "-"}`,
+      `🧊 Mais frio: ${coldest ? `${coldest.mult} (${fmtScore(coldest.score)})` : "-"}`,
+      `🏆 Win mais recente: ${latestWin ? `${latestWin.mult} no bloco ${latestWin.lastWinBlock}` : "-"}`,
+    ].join("\n")
+  );
+});
+
 bot.onText(/\/top/, (msg) => {
   const chatId = msg.chat.id;
   if (!allowedChat(chatId)) return;
 
-  const rows = topLossRows(TOP_N);
+  const rows = rowsByVarianceDesc(TOP_N);
   if (!rows.length) {
     send(chatId, "Sem dados ainda. O scanner está carregando histórico.");
     return;
   }
 
   const lines = [];
-  lines.push("📊 Top LOSS (após último WIN)");
+  lines.push("📊 TOP ESTICADOS PELA VARIÂNCIA");
   lines.push("");
 
-  for (const r of rows.slice(0, TOP_N)) {
-    lines.push(`${r.mult} → ${r.loss} LOSS | spins ${r.spins} | wins ${r.wins}`);
+  rows.slice(0, TOP_N).forEach((r, i) => {
+    lines.push(
+      `${i + 1}. ${r.mult} → LOSS ${r.loss} | esperado ${r.expLoss.toFixed(1)} | score ${fmtScore(r.score)}`
+    );
+  });
+
+  send(chatId, lines.join("\n"));
+});
+
+bot.onText(/\/rank/, (msg) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+
+  const rows = rowsByVarianceDesc(TOP_N);
+  if (!rows.length) {
+    send(chatId, "Sem dados ainda. O scanner está carregando histórico.");
+    return;
+  }
+
+  const lines = ["📈 RANKING POR VARIÂNCIA", ""];
+  for (const r of rows) {
+    lines.push(
+      `${r.mult} | score ${fmtScore(r.score)} | LOSS ${r.loss} | esperado ${r.expLoss.toFixed(1)} | ${varianceStatus(r.score)}`
+    );
   }
 
   send(chatId, lines.join("\n"));
 });
 
-bot.onText(/\/m (.+)/, (msg, match) => {
+bot.onText(/\/hot/, (msg) => {
   const chatId = msg.chat.id;
   if (!allowedChat(chatId)) return;
 
-  const query = String(match[1] || "").trim();
-  if (!query) {
-    send(chatId, "Uso: /m 100x  (ou /m 1.40x)");
+  const rows = rowsByVarianceDesc(10);
+  if (!rows.length) {
+    send(chatId, "Sem dados ainda. O scanner está carregando histórico.");
     return;
   }
 
-  let key = query.toLowerCase().includes("x") ? query : (query + "x");
-  let foundKey = null;
+  const lines = ["🔥 MAIS ATRASADOS AGORA", ""];
+  rows.forEach((r, i) => {
+    lines.push(`${i + 1}. ${r.mult} | score ${fmtScore(r.score)} | LOSS ${r.loss}`);
+  });
 
-  if (stats.has(key)) foundKey = key;
-  else {
-    const qn = Number(key.replace("x", "").trim());
-    if (Number.isFinite(qn)) {
-      let best = null;
-      let bestDiff = Infinity;
-      for (const k of stats.keys()) {
-        const kn = Number(String(k).replace("x", ""));
-        if (!Number.isFinite(kn)) continue;
-        const diff = Math.abs(kn - qn);
-        if (diff < bestDiff) {
-          bestDiff = diff;
-          best = k;
-        }
-      }
-      if (best != null && bestDiff <= 0.05) foundKey = best;
-    }
+  send(chatId, lines.join("\n"));
+});
+
+bot.onText(/\/cold/, (msg) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+
+  const rows = rowsByVarianceAsc(10);
+  if (!rows.length) {
+    send(chatId, "Sem dados ainda. O scanner está carregando histórico.");
+    return;
   }
+
+  const lines = ["🧊 MENOS ATRASADOS AGORA", ""];
+  rows.forEach((r, i) => {
+    lines.push(`${i + 1}. ${r.mult} | score ${fmtScore(r.score)} | LOSS ${r.loss}`);
+  });
+
+  send(chatId, lines.join("\n"));
+});
+
+bot.onText(/\/win/, (msg) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+
+  const rows = latestWinsRows(10);
+  if (!rows.length) {
+    send(chatId, "Ainda não há wins registrados no período carregado.");
+    return;
+  }
+
+  const lines = ["🏆 ÚLTIMOS WINS", ""];
+  for (const r of rows) {
+    lines.push(
+      [
+        `${r.mult} | bloco ${r.lastWinBlock}`,
+        `ganhador: ${r.lastWinner ? fmtAddr(r.lastWinner) : "-"}`,
+        `wager: ${fmtUnits(r.lastWagerRaw, tokenInfo.decimals, tokenInfo.symbol)}`,
+        `payout: ${fmtUnits(r.lastPayoutRaw, tokenInfo.decimals, tokenInfo.symbol)}`,
+        `jackpot: ${fmtUnits(r.lastJackpotRaw, tokenInfo.decimals, tokenInfo.symbol)}`,
+        "",
+      ].join("\n")
+    );
+  }
+
+  send(chatId, lines.join("\n"));
+});
+
+bot.onText(/\/m(?:\s+(.+))?/, (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+
+  const query = String(match?.[1] || "").trim();
+  if (!query) {
+    send(chatId, "Uso: /m 100x  ou  /m 66.45");
+    return;
+  }
+
+  const foundKey = findMultiplierKey(query);
 
   if (!foundKey || !stats.has(foundKey)) {
-    send(chatId, `Não achei esse multiplicador ainda: ${query}\nTente /top pra ver os disponíveis.`);
+    send(chatId, `Não achei esse multiplicador ainda: ${query}\nTente /top para ver os disponíveis.`);
     return;
   }
 
-  const s = stats.get(foundKey);
+  send(chatId, buildMultiplierDetails(foundKey));
+});
 
-  const wager = s.lastWinBlock == null ? "-" : fmtUnits(s.lastWagerRaw, tokenInfo.decimals, tokenInfo.symbol);
-  const payout = s.lastWinBlock == null ? "-" : fmtUnits(s.lastPayoutRaw, tokenInfo.decimals, tokenInfo.symbol);
-  const jackpot = s.lastWinBlock == null ? "-" : fmtUnits(s.lastJackpotRaw, tokenInfo.decimals, tokenInfo.symbol);
+bot.onText(/\/compare(?:\s+(.+))?/, (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+
+  const raw = String(match?.[1] || "").trim();
+  const parts = raw.split(/\s+/).filter(Boolean);
+
+  if (parts.length < 2) {
+    send(chatId, "Uso: /compare 30 66.45");
+    return;
+  }
+
+  const k1 = findMultiplierKey(parts[0]);
+  const k2 = findMultiplierKey(parts[1]);
+
+  if (!k1 || !k2 || !stats.has(k1) || !stats.has(k2)) {
+    send(chatId, "Não consegui encontrar os dois multiplicadores. Tente valores como /compare 30 66.45");
+    return;
+  }
+
+  const s1 = stats.get(k1);
+  const s2 = stats.get(k2);
+
+  const sc1 = varianceScore(k1, s1.loss);
+  const sc2 = varianceScore(k2, s2.loss);
 
   send(
     chatId,
     [
-      `📌 ${foundKey}`,
+      "⚖️ COMPARAÇÃO",
       "",
-      `LOSS atuais: ${s.loss}`,
-      `SPINS: ${s.spins}`,
-      `WINS: ${s.wins}`,
+      `${k1}`,
+      `LOSS: ${s1.loss} | WINS: ${s1.wins} | SPINS: ${s1.spins}`,
+      `Chance teórica: ${fmtPct(theoreticalWinChance(k1))}`,
+      `Loss esperado: ${expectedLossBeforeWin(k1)?.toFixed(2) ?? "-"}`,
+      `Score variância: ${fmtScore(sc1)}`,
+      `Status: ${varianceStatus(sc1)}`,
       "",
-      `Último WIN (bloco): ${s.lastWinBlock == null ? "-" : s.lastWinBlock}`,
-      `Último ganhador: ${s.lastWinner ? fmtAddr(s.lastWinner) : "-"}`,
-      `Wager: ${wager}`,
-      `Payout: ${payout}`,
-      `Jackpot: ${jackpot}`,
-      `Último spin (bloco): ${s.lastSpinBlock || "-"}`,
+      `${k2}`,
+      `LOSS: ${s2.loss} | WINS: ${s2.wins} | SPINS: ${s2.spins}`,
+      `Chance teórica: ${fmtPct(theoreticalWinChance(k2))}`,
+      `Loss esperado: ${expectedLossBeforeWin(k2)?.toFixed(2) ?? "-"}`,
+      `Score variância: ${fmtScore(sc2)}`,
+      `Status: ${varianceStatus(sc2)}`,
     ].join("\n")
   );
 });
