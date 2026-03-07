@@ -6,7 +6,7 @@ const { ethers } = require("ethers");
 // =====================
 // ENV
 // =====================
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const TELEGRAM_ALLOWED_CHAT_IDS = (process.env.TELEGRAM_ALLOWED_CHAT_IDS || "")
   .split(",")
   .map((s) => s.trim())
@@ -16,13 +16,32 @@ const CHAIN_ID = Number(process.env.CHAIN_ID || 42161);
 const CONTRACT_ADDRESS = (process.env.CONTRACT_ADDRESS || "").trim();
 
 const DAYS_BACK = Number(process.env.DAYS_BACK || 90);
+const RESUME = Number(process.env.RESUME || 1);
+
 const RPC_URL = (process.env.RPC_URL || "").trim();
 
 const HIST_CHUNK_BLOCKS = Number(process.env.HIST_CHUNK_BLOCKS || 6000);
+const HIST_RETRY_DELAY_MS = Number(process.env.HIST_RETRY_DELAY_MS || 2000);
+
 const LIVE_STEP_BLOCKS = Number(process.env.LIVE_STEP_BLOCKS || 3000);
 const POLL_MS = Number(process.env.POLL_MS || 1500);
 const RPC_TIMEOUT_MS = Number(process.env.RPC_TIMEOUT_MS || 30000);
 const BLOCKS_PER_DAY = Number(process.env.BLOCKS_PER_DAY || 345600);
+const LIVE_MAX_LAG_BLOCKS = Number(process.env.LIVE_MAX_LAG_BLOCKS || 2000000);
+
+if (!TELEGRAM_BOT_TOKEN) throw new Error("Faltou TELEGRAM_BOT_TOKEN");
+if (!RPC_URL) throw new Error("Faltou RPC_URL");
+if (!CONTRACT_ADDRESS) throw new Error("Faltou CONTRACT_ADDRESS");
+
+// =====================
+// PATHS / STATE FILE
+// =====================
+const DATA_DIR = path.join(process.cwd(), "data");
+const STATE_FILE = path.join(DATA_DIR, "scanner_state.json");
+
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
 // =====================
 // HELPERS
@@ -67,16 +86,11 @@ function allowedChat(chatId) {
 // =====================
 // TELEGRAM
 // =====================
-if (!TELEGRAM_BOT_TOKEN) {
-  throw new Error("Faltou TELEGRAM_BOT_TOKEN");
-}
-
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
 
 let pollingStarting = false;
 let pollingStarted = false;
 
-// evita processar o mesmo comando duas vezes em poucos segundos
 const recentCommands = new Map();
 
 function shouldProcessCommand(chatId, text, windowMs = 2500) {
@@ -84,7 +98,6 @@ function shouldProcessCommand(chatId, text, windowMs = 2500) {
   const key = `${chatId}:${String(text || "").trim()}`;
   const last = recentCommands.get(key);
 
-  // limpeza simples
   for (const [k, ts] of recentCommands.entries()) {
     if (now - ts > 15000) recentCommands.delete(k);
   }
@@ -108,14 +121,9 @@ async function startTelegramPolling() {
   pollingStarting = true;
 
   try {
-    // limpa webhook antigo, se existir
     await bot.deleteWebHook({ drop_pending_updates: false }).catch(() => {});
-
-    // garante que qualquer polling local desta instância foi parado
     await bot.stopPolling().catch(() => {});
-
-    // dá tempo da instância antiga do Railway morrer
-    await sleep(8000);
+    await sleep(4000);
 
     await bot.startPolling({
       restart: true,
@@ -163,6 +171,16 @@ bot.on("polling_error", async (err) => {
 const stats = new Map();
 const startMap = new Map();
 
+let latestKnownBlock = 0;
+let historicalRunning = false;
+let historicalFinished = false;
+let liveRunning = false;
+let historicalCursor = null;
+let historicalStartBlock = null;
+
+// evita live e histórico processarem o mesmo tempo de forma bagunçada
+let processingLock = false;
+
 function getStat(mult) {
   if (!stats.has(mult)) {
     stats.set(mult, {
@@ -179,12 +197,72 @@ function getStat(mult) {
   return stats.get(mult);
 }
 
+function serializeStats() {
+  const out = {};
+  for (const [mult, s] of stats.entries()) {
+    out[mult] = {
+      ...s,
+      lastWager: String(s.lastWager || 0n),
+      lastPayout: String(s.lastPayout || 0n),
+      lastJackpot: String(s.lastJackpot || 0n),
+    };
+  }
+  return out;
+}
+
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) return;
+
+    const raw = fs.readFileSync(STATE_FILE, "utf8");
+    const data = JSON.parse(raw);
+
+    latestKnownBlock = Number(data.latestKnownBlock || 0);
+    historicalFinished = Boolean(data.historicalFinished);
+    historicalCursor = data.historicalCursor == null ? null : Number(data.historicalCursor);
+    historicalStartBlock = data.historicalStartBlock == null ? null : Number(data.historicalStartBlock);
+
+    if (data.stats && typeof data.stats === "object") {
+      for (const [mult, s] of Object.entries(data.stats)) {
+        stats.set(mult, {
+          loss: Number(s.loss || 0),
+          wins: Number(s.wins || 0),
+          spins: Number(s.spins || 0),
+          lastWinBlock: s.lastWinBlock == null ? null : Number(s.lastWinBlock),
+          lastWinner: s.lastWinner || null,
+          lastWager: BigInt(s.lastWager || "0"),
+          lastPayout: BigInt(s.lastPayout || "0"),
+          lastJackpot: BigInt(s.lastJackpot || "0"),
+        });
+      }
+    }
+
+    console.log("♻️ state carregado");
+  } catch (e) {
+    console.log("Erro ao carregar state:", e?.message || e);
+  }
+}
+
+function saveState() {
+  try {
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      latestKnownBlock,
+      historicalFinished,
+      historicalCursor,
+      historicalStartBlock,
+      stats: serializeStats(),
+    };
+
+    fs.writeFileSync(STATE_FILE, JSON.stringify(payload, null, 2));
+  } catch (e) {
+    console.log("Erro ao salvar state:", e?.message || e);
+  }
+}
+
 // =====================
 // PROVIDER
 // =====================
-if (!RPC_URL) throw new Error("Faltou RPC_URL");
-if (!CONTRACT_ADDRESS) throw new Error("Faltou CONTRACT_ADDRESS");
-
 const provider = new ethers.JsonRpcProvider(
   RPC_URL,
   CHAIN_ID,
@@ -236,6 +314,8 @@ function onSpinResolved(log) {
   } else {
     s.loss++;
   }
+
+  startMap.delete(id);
 }
 
 function varianceRows(n = 10) {
@@ -278,6 +358,7 @@ bot.onText(/\/help/, (msg) => {
       "/m 30 → detalhes multiplicador",
       "/lastwin 30 → último ganhador",
       "/stats → resumo",
+      "/status → andamento do scanner",
       "/chatid",
     ].join("\n")
   );
@@ -287,6 +368,26 @@ bot.onText(/\/chatid/, (msg) => {
   const chatId = msg.chat.id;
   if (!shouldProcessCommand(chatId, msg.text)) return;
   send(chatId, String(chatId));
+});
+
+bot.onText(/\/status/, (msg) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+  if (!shouldProcessCommand(chatId, msg.text)) return;
+
+  send(
+    chatId,
+    [
+      "📡 STATUS",
+      `telegram: ${pollingStarted ? "online" : "offline"}`,
+      `histórico rodando: ${historicalRunning ? "sim" : "não"}`,
+      `histórico finalizado: ${historicalFinished ? "sim" : "não"}`,
+      `live rodando: ${liveRunning ? "sim" : "não"}`,
+      `latestKnownBlock: ${latestKnownBlock || "-"}`,
+      `historicalCursor: ${historicalCursor || "-"}`,
+      `multiplicadores: ${stats.size}`,
+    ].join("\n")
+  );
 });
 
 bot.onText(/\/stats/, (msg) => {
@@ -435,32 +536,89 @@ async function getLogs(from, to, topic) {
   });
 }
 
+async function processRange(from, to, label) {
+  const [a, b] = await Promise.all([
+    getLogs(from, to, topicStarted),
+    getLogs(from, to, topicResolved),
+  ]);
+
+  a.forEach(onSpinStarted);
+  b.forEach(onSpinResolved);
+
+  if (to > latestKnownBlock) {
+    latestKnownBlock = to;
+  }
+
+  console.log(`${label} ${from} -> ${to}`);
+}
+
+async function withProcessingLock(fn) {
+  while (processingLock) {
+    await sleep(20);
+  }
+
+  processingLock = true;
+  try {
+    return await fn();
+  } finally {
+    processingLock = false;
+  }
+}
+
 // =====================
 // HISTORICAL
 // =====================
 async function scanHistorical() {
-  const latest = await provider.getBlockNumber();
+  if (historicalRunning) return;
+  historicalRunning = true;
 
-  const from = Math.max(
-    0,
-    latest - (DAYS_BACK * BLOCKS_PER_DAY)
-  );
+  try {
+    const latest = await provider.getBlockNumber();
 
-  let cur = from;
+    const baseFrom = Math.max(
+      0,
+      latest - (DAYS_BACK * BLOCKS_PER_DAY)
+    );
 
-  while (cur <= latest) {
-    const end = Math.min(latest, cur + HIST_CHUNK_BLOCKS);
+    if (!RESUME || historicalStartBlock == null) {
+      historicalStartBlock = baseFrom;
+    }
 
-    const [a, b] = await Promise.all([
-      getLogs(cur, end, topicStarted),
-      getLogs(cur, end, topicResolved),
-    ]);
+    if (!RESUME || historicalCursor == null) {
+      historicalCursor = historicalStartBlock;
+    }
 
-    a.forEach(onSpinStarted);
-    b.forEach(onSpinResolved);
+    if (historicalCursor < historicalStartBlock) {
+      historicalCursor = historicalStartBlock;
+    }
 
-    cur = end + 1;
-    console.log("hist", cur);
+    console.log(`📚 histórico start=${historicalStartBlock} latest=${latest} cursor=${historicalCursor}`);
+
+    while (historicalCursor <= latest) {
+      const from = historicalCursor;
+      const to = Math.min(latest, from + HIST_CHUNK_BLOCKS - 1);
+
+      try {
+        await withProcessingLock(async () => {
+          await processRange(from, to, "hist");
+        });
+
+        historicalCursor = to + 1;
+        saveState();
+        await sleep(1);
+      } catch (e) {
+        console.log("hist error:", e?.message || e);
+        await sleep(HIST_RETRY_DELAY_MS);
+      }
+    }
+
+    historicalFinished = true;
+    saveState();
+    console.log("✅ histórico finalizado");
+  } catch (e) {
+    console.log("Erro no histórico:", e?.message || e);
+  } finally {
+    historicalRunning = false;
   }
 }
 
@@ -468,27 +626,50 @@ async function scanHistorical() {
 // LIVE
 // =====================
 async function scanLive() {
-  let next = await provider.getBlockNumber();
+  if (liveRunning) return;
+  liveRunning = true;
 
-  while (true) {
-    const latest = await provider.getBlockNumber();
+  try {
+    let next = await provider.getBlockNumber();
 
-    if (next > latest) {
-      await sleep(POLL_MS);
-      continue;
+    if (latestKnownBlock > 0) {
+      next = Math.max(next, latestKnownBlock + 1);
     }
 
-    const to = Math.min(latest, next + LIVE_STEP_BLOCKS);
+    console.log("📡 live mode");
 
-    const [a, b] = await Promise.all([
-      getLogs(next, to, topicStarted),
-      getLogs(next, to, topicResolved),
-    ]);
+    while (true) {
+      try {
+        const latest = await provider.getBlockNumber();
 
-    a.forEach(onSpinStarted);
-    b.forEach(onSpinResolved);
+        let from = next;
+        const minAllowed = Math.max(0, latest - LIVE_MAX_LAG_BLOCKS);
 
-    next = to + 1;
+        if (from < minAllowed) {
+          from = minAllowed;
+        }
+
+        if (from > latest) {
+          await sleep(POLL_MS);
+          continue;
+        }
+
+        const to = Math.min(latest, from + LIVE_STEP_BLOCKS - 1);
+
+        await withProcessingLock(async () => {
+          await processRange(from, to, "live");
+        });
+
+        next = to + 1;
+        saveState();
+        await sleep(1);
+      } catch (e) {
+        console.log("live error:", e?.message || e);
+        await sleep(Math.max(POLL_MS, 2000));
+      }
+    }
+  } finally {
+    liveRunning = false;
   }
 }
 
@@ -498,13 +679,39 @@ async function scanLive() {
 (async () => {
   console.log("🚀 scanner start");
 
-  await scanHistorical();
+  if (RESUME) {
+    loadState();
+  }
 
   await startTelegramPolling();
 
-  console.log("📡 live mode");
+  scanHistorical().catch((e) => {
+    console.log("scanHistorical error:", e?.message || e);
+  });
 
-  await scanLive();
+  scanLive().catch((e) => {
+    console.log("scanLive error:", e?.message || e);
+  });
 })().catch((e) => {
   console.error("❌ erro fatal:", e?.message || e);
+});
+
+// =====================
+// EXIT
+// =====================
+function shutdown(signal) {
+  try {
+    console.log(`🛑 ${signal}`);
+    saveState();
+  } catch {}
+  process.exit(0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("uncaughtException", (e) => {
+  console.log("uncaughtException:", e?.message || e);
+});
+process.on("unhandledRejection", (e) => {
+  console.log("unhandledRejection:", e?.message || e);
 });
