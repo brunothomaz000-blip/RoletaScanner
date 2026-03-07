@@ -94,37 +94,6 @@ function formatTokenAmount(raw, decimals = 18) {
   }
 }
 
-// snapshot estável para comandos não lerem o Map enquanto o live/hist atualiza
-function getStatsSnapshot() {
-  return [...stats.entries()].map(([mult, s]) => ({
-    mult,
-    loss: Number(s.loss || 0),
-    wins: Number(s.wins || 0),
-    spins: Number(s.spins || 0),
-    lastWinBlock: s.lastWinBlock == null ? null : Number(s.lastWinBlock),
-    lastWinner: s.lastWinner || null,
-    lastWager: BigInt(s.lastWager || 0n),
-    lastPayout: BigInt(s.lastPayout || 0n),
-    lastJackpot: BigInt(s.lastJackpot || 0n),
-  }));
-}
-
-function getStatSnapshotByKey(key) {
-  const s = stats.get(key);
-  if (!s) return null;
-  return {
-    mult: key,
-    loss: Number(s.loss || 0),
-    wins: Number(s.wins || 0),
-    spins: Number(s.spins || 0),
-    lastWinBlock: s.lastWinBlock == null ? null : Number(s.lastWinBlock),
-    lastWinner: s.lastWinner || null,
-    lastWager: BigInt(s.lastWager || 0n),
-    lastPayout: BigInt(s.lastPayout || 0n),
-    lastJackpot: BigInt(s.lastJackpot || 0n),
-  };
-}
-
 // =====================
 // TELEGRAM
 // =====================
@@ -232,6 +201,11 @@ let latestChainHead = 0;
 
 let processingLock = false;
 
+// guards extras
+let historicalLoopStarted = false;
+let liveLoopStarted = false;
+let initialized = false;
+
 function getStat(mult) {
   if (!stats.has(mult)) {
     stats.set(mult, {
@@ -316,6 +290,40 @@ function saveState() {
   } catch (e) {
     console.log("Erro ao salvar state:", e?.message || e);
   }
+}
+
+// =====================
+// SNAPSHOTS ESTÁVEIS
+// =====================
+function getStatsSnapshot() {
+  return [...stats.entries()].map(([mult, s]) => ({
+    mult,
+    loss: Number(s.loss || 0),
+    wins: Number(s.wins || 0),
+    spins: Number(s.spins || 0),
+    lastWinBlock: s.lastWinBlock == null ? null : Number(s.lastWinBlock),
+    lastWinner: s.lastWinner || null,
+    lastWager: BigInt(s.lastWager || 0n),
+    lastPayout: BigInt(s.lastPayout || 0n),
+    lastJackpot: BigInt(s.lastJackpot || 0n),
+  }));
+}
+
+function getStatSnapshotByKey(key) {
+  const s = stats.get(key);
+  if (!s) return null;
+
+  return {
+    mult: key,
+    loss: Number(s.loss || 0),
+    wins: Number(s.wins || 0),
+    spins: Number(s.spins || 0),
+    lastWinBlock: s.lastWinBlock == null ? null : Number(s.lastWinBlock),
+    lastWinner: s.lastWinner || null,
+    lastWager: BigInt(s.lastWager || 0n),
+    lastPayout: BigInt(s.lastPayout || 0n),
+    lastJackpot: BigInt(s.lastJackpot || 0n),
+  };
 }
 
 // =====================
@@ -644,6 +652,13 @@ async function withProcessingLock(fn) {
 // INIT RANGES
 // =====================
 async function initializeRanges() {
+  if (initialized) {
+    console.log("ℹ️ initializeRanges já executado, ignorando");
+    return;
+  }
+
+  initialized = true;
+
   const head = await provider.getBlockNumber();
   latestChainHead = head;
 
@@ -680,7 +695,12 @@ async function initializeRanges() {
 // HISTORICAL
 // =====================
 async function scanHistorical() {
-  if (historicalRunning) return;
+  if (historicalLoopStarted || historicalRunning) {
+    console.log("ℹ️ scanHistorical já está rodando, ignorando nova chamada");
+    return;
+  }
+
+  historicalLoopStarted = true;
   historicalRunning = true;
 
   try {
@@ -692,10 +712,21 @@ async function scanHistorical() {
 
       try {
         await withProcessingLock(async () => {
+          // proteção: se alguém alterou cursor para trás indevidamente, não usa valor antigo
+          if (historicalCursor !== from) {
+            console.log(`⚠️ cursor histórico mudou durante processamento. esperado=${from} atual=${historicalCursor}`);
+            return;
+          }
           await processRange(from, to, "hist");
         });
 
-        historicalCursor = to + 1;
+        // só avança se ainda estiver na mesma faixa
+        if (historicalCursor === from) {
+          historicalCursor = to + 1;
+        } else {
+          console.log(`⚠️ histórico não avançado porque cursor mudou. atual=${historicalCursor}`);
+        }
+
         saveState();
         await sleep(1);
       } catch (e) {
@@ -718,7 +749,12 @@ async function scanHistorical() {
 // LIVE
 // =====================
 async function scanLive() {
-  if (liveRunning) return;
+  if (liveLoopStarted || liveRunning) {
+    console.log("ℹ️ scanLive já está rodando, ignorando nova chamada");
+    return;
+  }
+
+  liveLoopStarted = true;
   liveRunning = true;
 
   try {
@@ -745,6 +781,9 @@ async function scanLive() {
         const to = Math.min(latest, from + LIVE_STEP_BLOCKS - 1);
 
         await withProcessingLock(async () => {
+          if (liveNextBlock !== from && liveNextBlock < from) {
+            console.log(`⚠️ liveNextBlock inesperado. from=${from} liveNextBlock=${liveNextBlock}`);
+          }
           await processRange(from, to, "live");
         });
 
