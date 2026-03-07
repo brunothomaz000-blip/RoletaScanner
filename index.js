@@ -28,6 +28,7 @@ const POLL_MS = Number(process.env.POLL_MS || 1500);
 const RPC_TIMEOUT_MS = Number(process.env.RPC_TIMEOUT_MS || 30000);
 const BLOCKS_PER_DAY = Number(process.env.BLOCKS_PER_DAY || 345600);
 const LIVE_MAX_LAG_BLOCKS = Number(process.env.LIVE_MAX_LAG_BLOCKS || 2000000);
+const TOP_SHOW_LIMIT = Number(process.env.TOP_SHOW_LIMIT || 25);
 
 if (!TELEGRAM_BOT_TOKEN) throw new Error("Faltou TELEGRAM_BOT_TOKEN");
 if (!RPC_URL) throw new Error("Faltou RPC_URL");
@@ -384,7 +385,7 @@ function onSpinResolved(log) {
   startMap.delete(id);
 }
 
-function varianceRows(n = 10) {
+function varianceRows(n = TOP_SHOW_LIMIT) {
   const snapshot = getStatsSnapshot();
   const arr = [];
 
@@ -494,7 +495,7 @@ bot.onText(/\/top/, (msg) => {
 
   const arr = snapshot
     .sort((a, b) => b.loss - a.loss)
-    .slice(0, 10);
+    .slice(0, TOP_SHOW_LIMIT);
 
   if (!arr.length) {
     send(chatId, "Sem dados ainda. O scanner está carregando histórico.");
@@ -502,7 +503,7 @@ bot.onText(/\/top/, (msg) => {
   }
 
   const lines = ["📊 TOP LOSS", ""];
-  arr.forEach((r) => lines.push(`${r.mult} → ${r.loss} LOSS`));
+  arr.forEach((r, i) => lines.push(`${i + 1}️⃣ ${r.mult} → ${r.loss} LOSS`));
   send(chatId, lines.join("\n"));
 });
 
@@ -511,7 +512,7 @@ bot.onText(/\/best/, (msg) => {
   if (!allowedChat(chatId)) return;
   if (!shouldProcessCommand(chatId, msg.text)) return;
 
-  const rows = varianceRows(10);
+  const rows = varianceRows(TOP_SHOW_LIMIT);
 
   if (!rows.length) {
     send(chatId, "Sem dados ainda. O scanner está carregando histórico.");
@@ -712,7 +713,6 @@ async function scanHistorical() {
 
       try {
         await withProcessingLock(async () => {
-          // proteção: se alguém alterou cursor para trás indevidamente, não usa valor antigo
           if (historicalCursor !== from) {
             console.log(`⚠️ cursor histórico mudou durante processamento. esperado=${from} atual=${historicalCursor}`);
             return;
@@ -720,7 +720,6 @@ async function scanHistorical() {
           await processRange(from, to, "hist");
         });
 
-        // só avança se ainda estiver na mesma faixa
         if (historicalCursor === from) {
           historicalCursor = to + 1;
         } else {
