@@ -162,6 +162,11 @@ bot.on("polling_error", async (err) => {
 
   if (/409|terminated by other getUpdates request|conflict/i.test(msg)) {
     await restartTelegramPolling("409 conflict");
+    return;
+  }
+
+  if (/401|unauthorized/i.test(msg)) {
+    pollingStarted = false;
   }
 });
 
@@ -171,14 +176,18 @@ bot.on("polling_error", async (err) => {
 const stats = new Map();
 const startMap = new Map();
 
-let latestKnownBlock = 0;
 let historicalRunning = false;
 let historicalFinished = false;
 let liveRunning = false;
-let historicalCursor = null;
-let historicalStartBlock = null;
 
-// evita live e histórico processarem o mesmo tempo de forma bagunçada
+let historicalStartBlock = null;
+let historicalCursor = null;
+let historicalEndBlock = null;   // foto do bloco atual quando inicia
+
+let liveNextBlock = null;        // sempre começa em historicalEndBlock + 1
+let latestLiveBlock = 0;         // último bloco realmente processado no live
+let latestChainHead = 0;         // último head visto na chain
+
 let processingLock = false;
 
 function getStat(mult) {
@@ -217,10 +226,14 @@ function loadState() {
     const raw = fs.readFileSync(STATE_FILE, "utf8");
     const data = JSON.parse(raw);
 
-    latestKnownBlock = Number(data.latestKnownBlock || 0);
     historicalFinished = Boolean(data.historicalFinished);
-    historicalCursor = data.historicalCursor == null ? null : Number(data.historicalCursor);
     historicalStartBlock = data.historicalStartBlock == null ? null : Number(data.historicalStartBlock);
+    historicalCursor = data.historicalCursor == null ? null : Number(data.historicalCursor);
+    historicalEndBlock = data.historicalEndBlock == null ? null : Number(data.historicalEndBlock);
+
+    liveNextBlock = data.liveNextBlock == null ? null : Number(data.liveNextBlock);
+    latestLiveBlock = Number(data.latestLiveBlock || 0);
+    latestChainHead = Number(data.latestChainHead || 0);
 
     if (data.stats && typeof data.stats === "object") {
       for (const [mult, s] of Object.entries(data.stats)) {
@@ -247,10 +260,13 @@ function saveState() {
   try {
     const payload = {
       updatedAt: new Date().toISOString(),
-      latestKnownBlock,
       historicalFinished,
-      historicalCursor,
       historicalStartBlock,
+      historicalCursor,
+      historicalEndBlock,
+      liveNextBlock,
+      latestLiveBlock,
+      latestChainHead,
       stats: serializeStats(),
     };
 
@@ -383,8 +399,12 @@ bot.onText(/\/status/, (msg) => {
       `histórico rodando: ${historicalRunning ? "sim" : "não"}`,
       `histórico finalizado: ${historicalFinished ? "sim" : "não"}`,
       `live rodando: ${liveRunning ? "sim" : "não"}`,
-      `latestKnownBlock: ${latestKnownBlock || "-"}`,
+      `latestChainHead: ${latestChainHead || "-"}`,
+      `historicalStartBlock: ${historicalStartBlock || "-"}`,
       `historicalCursor: ${historicalCursor || "-"}`,
+      `historicalEndBlock: ${historicalEndBlock || "-"}`,
+      `liveNextBlock: ${liveNextBlock || "-"}`,
+      `latestLiveBlock: ${latestLiveBlock || "-"}`,
       `multiplicadores: ${stats.size}`,
     ].join("\n")
   );
@@ -545,10 +565,6 @@ async function processRange(from, to, label) {
   a.forEach(onSpinStarted);
   b.forEach(onSpinResolved);
 
-  if (to > latestKnownBlock) {
-    latestKnownBlock = to;
-  }
-
   console.log(`${label} ${from} -> ${to}`);
 }
 
@@ -566,6 +582,42 @@ async function withProcessingLock(fn) {
 }
 
 // =====================
+// INIT RANGES
+// =====================
+async function initializeRanges() {
+  const head = await provider.getBlockNumber();
+  latestChainHead = head;
+
+  if (RESUME) {
+    loadState();
+  }
+
+  if (historicalEndBlock == null || !RESUME) {
+    historicalEndBlock = head;
+  }
+
+  const start = Math.max(0, historicalEndBlock - (DAYS_BACK * BLOCKS_PER_DAY));
+
+  if (historicalStartBlock == null || !RESUME) {
+    historicalStartBlock = start;
+  }
+
+  if (historicalCursor == null || !RESUME) {
+    historicalCursor = historicalStartBlock;
+  }
+
+  if (liveNextBlock == null || !RESUME) {
+    liveNextBlock = historicalEndBlock + 1;
+  }
+
+  saveState();
+
+  console.log(
+    `🧭 ranges | hist: ${historicalStartBlock} -> ${historicalEndBlock} | live: ${liveNextBlock}+`
+  );
+}
+
+// =====================
 // HISTORICAL
 // =====================
 async function scanHistorical() {
@@ -573,30 +625,11 @@ async function scanHistorical() {
   historicalRunning = true;
 
   try {
-    const latest = await provider.getBlockNumber();
+    console.log(`📚 histórico start=${historicalStartBlock} end=${historicalEndBlock} cursor=${historicalCursor}`);
 
-    const baseFrom = Math.max(
-      0,
-      latest - (DAYS_BACK * BLOCKS_PER_DAY)
-    );
-
-    if (!RESUME || historicalStartBlock == null) {
-      historicalStartBlock = baseFrom;
-    }
-
-    if (!RESUME || historicalCursor == null) {
-      historicalCursor = historicalStartBlock;
-    }
-
-    if (historicalCursor < historicalStartBlock) {
-      historicalCursor = historicalStartBlock;
-    }
-
-    console.log(`📚 histórico start=${historicalStartBlock} latest=${latest} cursor=${historicalCursor}`);
-
-    while (historicalCursor <= latest) {
+    while (historicalCursor <= historicalEndBlock) {
       const from = historicalCursor;
-      const to = Math.min(latest, from + HIST_CHUNK_BLOCKS - 1);
+      const to = Math.min(historicalEndBlock, from + HIST_CHUNK_BLOCKS - 1);
 
       try {
         await withProcessingLock(async () => {
@@ -630,26 +663,22 @@ async function scanLive() {
   liveRunning = true;
 
   try {
-    let next = await provider.getBlockNumber();
-
-    if (latestKnownBlock > 0) {
-      next = Math.max(next, latestKnownBlock + 1);
-    }
-
-    console.log("📡 live mode");
+    console.log(`📡 live mode a partir de ${liveNextBlock}`);
 
     while (true) {
       try {
         const latest = await provider.getBlockNumber();
+        latestChainHead = latest;
 
-        let from = next;
-        const minAllowed = Math.max(0, latest - LIVE_MAX_LAG_BLOCKS);
+        let from = liveNextBlock;
+        const minAllowed = Math.max(historicalEndBlock + 1, latest - LIVE_MAX_LAG_BLOCKS);
 
         if (from < minAllowed) {
           from = minAllowed;
         }
 
         if (from > latest) {
+          saveState();
           await sleep(POLL_MS);
           continue;
         }
@@ -660,8 +689,10 @@ async function scanLive() {
           await processRange(from, to, "live");
         });
 
-        next = to + 1;
+        latestLiveBlock = to;
+        liveNextBlock = to + 1;
         saveState();
+
         await sleep(1);
       } catch (e) {
         console.log("live error:", e?.message || e);
@@ -679,10 +710,7 @@ async function scanLive() {
 (async () => {
   console.log("🚀 scanner start");
 
-  if (RESUME) {
-    loadState();
-  }
-
+  await initializeRanges();
   await startTelegramPolling();
 
   scanHistorical().catch((e) => {
