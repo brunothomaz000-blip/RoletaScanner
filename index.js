@@ -6,6 +6,7 @@ const { ethers } = require("ethers");
 // =====================
 // ENV
 // =====================
+
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_ALLOWED_CHAT_IDS = (process.env.TELEGRAM_ALLOWED_CHAT_IDS || "")
 .split(",")
@@ -23,24 +24,12 @@ const LIVE_STEP_BLOCKS = Number(process.env.LIVE_STEP_BLOCKS || 2500);
 const POLL_MS = Number(process.env.POLL_MS || 2000);
 
 const BLOCKS_PER_DAY = Number(process.env.BLOCKS_PER_DAY || 345600);
-const TOP_N = Number(process.env.TOP_N || 25);
 
 // =====================
 // TELEGRAM
 // =====================
 
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
-
-// evita polling duplicado
-(async () => {
-  try {
-    await bot.stopPolling().catch(()=>{});
-    await bot.startPolling();
-    console.log("🤖 Telegram polling iniciado");
-  } catch(e){
-    console.log("Erro polling:", e.message);
-  }
-})();
 
 function allowedChat(chatId){
   if(!TELEGRAM_ALLOWED_CHAT_IDS.length) return true
@@ -50,6 +39,35 @@ function allowedChat(chatId){
 function send(chatId,text){
   bot.sendMessage(chatId,text).catch(()=>{})
 }
+
+async function startTelegram(){
+
+  try{
+
+    await bot.deleteWebHook().catch(()=>{})
+
+    await bot.startPolling({
+      polling:{
+        interval:300,
+        params:{ timeout:10 }
+      }
+    })
+
+    console.log("🤖 Telegram conectado")
+
+  }catch(e){
+
+    console.log("Erro telegram:",e.message)
+
+  }
+
+}
+
+bot.on("polling_error",(err)=>{
+
+  console.log("⚠️ polling_error:",err?.message || err)
+
+})
 
 // =====================
 // HELPERS
@@ -111,8 +129,11 @@ function getStat(mult){
 const provider = new ethers.JsonRpcProvider(RPC_URL,CHAIN_ID)
 
 const ABI = [
+
 "event SpinStarted(uint256 indexed requestId,address indexed player,uint256 wager,uint256 netStake,uint256 multiplierHundredths,uint256 maxPayout,uint256 jackpotContribution,uint32 configIndex,bool participatingInJackpot)",
+
 "event SpinResolved(uint256 indexed requestId,address indexed player,uint8 outcome,uint256 payout,uint8 spinsConsumed,uint256 jackpotPayout)"
+
 ]
 
 const iface = new ethers.Interface(ABI)
@@ -169,58 +190,12 @@ function onSpinResolved(log){
 }
 
 // =====================
-// VARIANCE RANKING
-// =====================
-
-function varianceRows(n=10){
-
-  const arr=[]
-
-  for(const [mult,v] of stats.entries()){
-
-    if(multNum(mult)<2) continue
-    if(v.loss<5) continue
-    if(v.spins<10) continue
-
-    arr.push({
-      mult,
-      ...v,
-      expLoss:expectedLoss(mult),
-      score:varianceScore(mult,v.loss)
-    })
-
-  }
-
-  arr.sort((a,b)=>b.score-a.score)
-
-  return arr.slice(0,n)
-
-}
-
-// =====================
 // TELEGRAM COMMANDS
 // =====================
 
-bot.onText(/\/help/,msg=>{
-
-  send(msg.chat.id,
-`🤖 COMANDOS
-
-/best → melhores pela variância
-/top → maior sequência de loss
-/m 30 → detalhes multiplicador
-/lastwin 30 → último ganhador
-/stats → resumo
-/chatid`
-)
-
-})
-
-bot.onText(/\/chatid/,msg=>{
-  send(msg.chat.id,String(msg.chat.id))
-})
-
 bot.onText(/\/stats/,msg=>{
+
+  if(!allowedChat(msg.chat.id)) return
 
   let spins=0
   let wins=0
@@ -242,6 +217,8 @@ wins: ${wins}`
 
 bot.onText(/\/top/,msg=>{
 
+  if(!allowedChat(msg.chat.id)) return
+
   const arr=[...stats.entries()]
   .map(([m,v])=>({mult:m,...v}))
   .sort((a,b)=>b.loss-a.loss)
@@ -259,7 +236,30 @@ bot.onText(/\/top/,msg=>{
 
 bot.onText(/\/best/,msg=>{
 
-  const rows=varianceRows(10)
+  if(!allowedChat(msg.chat.id)) return
+
+  const arr=[]
+
+  for(const [mult,v] of stats.entries()){
+
+    if(multNum(mult)<2) continue
+    if(v.loss<5) continue
+    if(v.spins<10) continue
+
+    const exp=expectedLoss(mult)
+
+    arr.push({
+      mult,
+      loss:v.loss,
+      exp,
+      score:v.loss/exp
+    })
+
+  }
+
+  arr.sort((a,b)=>b.score-a.score)
+
+  const rows=arr.slice(0,10)
 
   const lines=["🔥 MELHORES PELA VARIÂNCIA\n"]
 
@@ -269,7 +269,7 @@ bot.onText(/\/best/,msg=>{
 `${i+1}️⃣ ${r.mult}
 score: ${r.score.toFixed(2)}
 loss: ${r.loss}
-esperado: ${r.expLoss.toFixed(1)}`
+esperado: ${r.exp.toFixed(1)}`
 )
 
   })
@@ -279,6 +279,8 @@ esperado: ${r.expLoss.toFixed(1)}`
 })
 
 bot.onText(/\/m (.+)/,(msg,match)=>{
+
+  if(!allowedChat(msg.chat.id)) return
 
   let q=match[1].replace(",",".")
 
@@ -307,6 +309,8 @@ score: ${(s.loss/exp).toFixed(2)}
 })
 
 bot.onText(/\/lastwin (.+)/,(msg,match)=>{
+
+  if(!allowedChat(msg.chat.id)) return
 
   let q=match[1].replace(",",".")
 
@@ -428,8 +432,14 @@ async function scanLive(){
 
   await scanHistorical()
 
+  await startTelegram()
+
   console.log("📡 live mode")
 
   await scanLive()
 
-})()
+})().catch((e)=>{
+
+  console.error("❌ erro fatal:",e?.message || e)
+
+})
