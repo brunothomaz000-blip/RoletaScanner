@@ -83,6 +83,48 @@ function allowedChat(chatId) {
   return TELEGRAM_ALLOWED_CHAT_IDS.includes(String(chatId));
 }
 
+function formatTokenAmount(raw, decimals = 18) {
+  try {
+    return Number(ethers.formatUnits(raw || 0n, decimals)).toLocaleString("pt-BR", {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 6,
+    });
+  } catch {
+    return "0";
+  }
+}
+
+// snapshot estável para comandos não lerem o Map enquanto o live/hist atualiza
+function getStatsSnapshot() {
+  return [...stats.entries()].map(([mult, s]) => ({
+    mult,
+    loss: Number(s.loss || 0),
+    wins: Number(s.wins || 0),
+    spins: Number(s.spins || 0),
+    lastWinBlock: s.lastWinBlock == null ? null : Number(s.lastWinBlock),
+    lastWinner: s.lastWinner || null,
+    lastWager: BigInt(s.lastWager || 0n),
+    lastPayout: BigInt(s.lastPayout || 0n),
+    lastJackpot: BigInt(s.lastJackpot || 0n),
+  }));
+}
+
+function getStatSnapshotByKey(key) {
+  const s = stats.get(key);
+  if (!s) return null;
+  return {
+    mult: key,
+    loss: Number(s.loss || 0),
+    wins: Number(s.wins || 0),
+    spins: Number(s.spins || 0),
+    lastWinBlock: s.lastWinBlock == null ? null : Number(s.lastWinBlock),
+    lastWinner: s.lastWinner || null,
+    lastWager: BigInt(s.lastWager || 0n),
+    lastPayout: BigInt(s.lastPayout || 0n),
+    lastJackpot: BigInt(s.lastJackpot || 0n),
+  };
+}
+
 // =====================
 // TELEGRAM
 // =====================
@@ -182,11 +224,11 @@ let liveRunning = false;
 
 let historicalStartBlock = null;
 let historicalCursor = null;
-let historicalEndBlock = null;   // foto do bloco atual quando inicia
+let historicalEndBlock = null;
 
-let liveNextBlock = null;        // sempre começa em historicalEndBlock + 1
-let latestLiveBlock = 0;         // último bloco realmente processado no live
-let latestChainHead = 0;         // último head visto na chain
+let liveNextBlock = null;
+let latestLiveBlock = 0;
+let latestChainHead = 0;
 
 let processingLock = false;
 
@@ -335,20 +377,20 @@ function onSpinResolved(log) {
 }
 
 function varianceRows(n = 10) {
+  const snapshot = getStatsSnapshot();
   const arr = [];
 
-  for (const [mult, v] of stats.entries()) {
-    if (multNum(mult) < 2) continue;
-    if (v.loss < 5) continue;
-    if (v.spins < 10) continue;
+  for (const r of snapshot) {
+    if (multNum(r.mult) < 2) continue;
+    if (r.loss < 5) continue;
+    if (r.spins < 10) continue;
 
-    const expLoss = expectedLoss(mult);
+    const expLoss = expectedLoss(r.mult);
 
     arr.push({
-      mult,
-      ...v,
+      ...r,
       expLoss,
-      score: varianceScore(mult, v.loss),
+      score: varianceScore(r.mult, r.loss),
     });
   }
 
@@ -415,10 +457,12 @@ bot.onText(/\/stats/, (msg) => {
   if (!allowedChat(chatId)) return;
   if (!shouldProcessCommand(chatId, msg.text)) return;
 
+  const snapshot = getStatsSnapshot();
+
   let spins = 0;
   let wins = 0;
 
-  for (const v of stats.values()) {
+  for (const v of snapshot) {
     spins += v.spins;
     wins += v.wins;
   }
@@ -427,7 +471,7 @@ bot.onText(/\/stats/, (msg) => {
     chatId,
     `📦 STATS
 
-multiplicadores: ${stats.size}
+multiplicadores: ${snapshot.length}
 spins: ${spins}
 wins: ${wins}`
   );
@@ -438,8 +482,9 @@ bot.onText(/\/top/, (msg) => {
   if (!allowedChat(chatId)) return;
   if (!shouldProcessCommand(chatId, msg.text)) return;
 
-  const arr = [...stats.entries()]
-    .map(([m, v]) => ({ mult: m, ...v }))
+  const snapshot = getStatsSnapshot();
+
+  const arr = snapshot
     .sort((a, b) => b.loss - a.loss)
     .slice(0, 10);
 
@@ -486,12 +531,13 @@ bot.onText(/\/m (.+)/, (msg, match) => {
   let q = String(match[1] || "").replace(",", ".");
   let key = q.includes("x") ? q : q + "x";
 
-  if (!stats.has(key)) {
+  const s = getStatSnapshotByKey(key);
+
+  if (!s) {
     send(chatId, "multiplicador não encontrado");
     return;
   }
 
-  const s = stats.get(key);
   const exp = expectedLoss(key);
   const prob = streakProbability(key, s.loss);
 
@@ -520,17 +566,21 @@ bot.onText(/\/lastwin (.+)/, (msg, match) => {
   let q = String(match[1] || "").replace(",", ".");
   let key = q.includes("x") ? q : q + "x";
 
-  if (!stats.has(key)) {
+  const s = getStatSnapshotByKey(key);
+
+  if (!s) {
     send(chatId, "multiplicador não encontrado");
     return;
   }
-
-  const s = stats.get(key);
 
   if (!s.lastWinBlock) {
     send(chatId, "nenhum win registrado ainda");
     return;
   }
+
+  const wager = formatTokenAmount(s.lastWager, 18);
+  const payout = formatTokenAmount(s.lastPayout, 18);
+  const jackpot = formatTokenAmount(s.lastJackpot, 18);
 
   send(
     chatId,
@@ -540,7 +590,16 @@ Carteira:
 ${s.lastWinner}
 
 Bloco:
-${s.lastWinBlock}`
+${s.lastWinBlock}
+
+Aposta:
+${wager} EVA
+
+Prêmio:
+${payout} EVA
+
+Jackpot:
+${jackpot} EVA`
   );
 });
 
