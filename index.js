@@ -810,13 +810,8 @@ async function scanLive() {
   await initializeRanges();
   await startTelegramPolling();
 
-  scanHistorical().catch((e) => {
-    console.log("scanHistorical error:", e?.message || e);
-  });
-
-  scanLive().catch((e) => {
-    console.log("scanLive error:", e?.message || e);
-  });
+  await scanHistorical();
+  await scanLive();
 })().catch((e) => {
   console.error("❌ erro fatal:", e?.message || e);
 });
