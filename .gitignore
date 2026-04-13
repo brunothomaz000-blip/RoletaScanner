@@ -1,0 +1,3 @@
+node_modules
+data/scanner_state.json
+.env
