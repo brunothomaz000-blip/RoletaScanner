@@ -1,1 +1,14 @@
-
+{
+  "name": "eva-roulette-scanner",
+  "version": "1.0.0",
+  "description": "Scanner da roleta EVA com Telegram",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ethers": "^6.13.2",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
