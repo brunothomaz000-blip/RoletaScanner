@@ -5,7 +5,8 @@
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "postinstall": "node -e \"console.log('deps ok')\""
   },
   "dependencies": {
     "ethers": "^6.13.2",
