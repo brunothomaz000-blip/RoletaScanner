@@ -13,7 +13,10 @@ const TELEGRAM_ALLOWED_CHAT_IDS = (process.env.TELEGRAM_ALLOWED_CHAT_IDS || "")
   .filter(Boolean);
 
 const CHAIN_ID = Number(process.env.CHAIN_ID || 42161);
-const CONTRACT_ADDRESS = (process.env.CONTRACT_ADDRESS || "").trim();
+const CONTRACT_ADDRESS = (
+  process.env.CONTRACT_ADDRESS ||
+  "0x29a597c324dce8f075d55acc7b0e65563ae180ab"
+).trim();
 
 const DAYS_BACK = Number(process.env.DAYS_BACK || 90);
 const RESUME = Number(process.env.RESUME || 1);
@@ -56,16 +59,18 @@ function fmtMult(h) {
 }
 
 function multNum(mult) {
-  return Number(String(mult).replace("x", ""));
+  return Number(String(mult).replace("x", "").replace(",", "."));
 }
 
 function winChance(mult) {
-  return 1 / multNum(mult);
+  const m = multNum(mult);
+  if (!Number.isFinite(m) || m <= 0) return 0;
+  return 1 / m;
 }
 
 function expectedLoss(mult) {
   const p = winChance(mult);
-  return (1 / p) - 1;
+  return p > 0 ? (1 / p) - 1 : 0;
 }
 
 function varianceScore(mult, loss) {
@@ -75,6 +80,7 @@ function varianceScore(mult, loss) {
 
 function streakProbability(mult, loss) {
   const p = winChance(mult);
+  if (p <= 0 || p >= 1) return 0;
   const lose = 1 - p;
   return Math.pow(lose, loss);
 }
@@ -93,6 +99,15 @@ function formatTokenAmount(raw, decimals = 18) {
   } catch {
     return "0";
   }
+}
+
+function normalizeMultiplierInput(input) {
+  const clean = String(input || "").trim().replace(",", ".");
+  if (!clean) return "";
+  const base = clean.toLowerCase().endsWith("x") ? clean.slice(0, -1) : clean;
+  const num = Number(base);
+  if (!Number.isFinite(num) || num <= 0) return clean.toLowerCase();
+  return fmtMult(Math.round(num * 100)).toLowerCase();
 }
 
 // =====================
@@ -186,7 +201,7 @@ bot.on("polling_error", async (err) => {
 // STATE
 // =====================
 const stats = new Map();
-const startMap = new Map();
+const pendingMap = new Map();
 
 let historicalRunning = false;
 let historicalFinished = false;
@@ -202,7 +217,6 @@ let latestChainHead = 0;
 
 let processingLock = false;
 
-// guards extras
 let historicalLoopStarted = false;
 let liveLoopStarted = false;
 let initialized = false;
@@ -218,6 +232,8 @@ function getStat(mult) {
       lastWager: 0n,
       lastPayout: 0n,
       lastJackpot: 0n,
+      lastOutcome: null,
+      lastSpinsConsumed: null,
     });
   }
   return stats.get(mult);
@@ -263,6 +279,8 @@ function loadState() {
           lastWager: BigInt(s.lastWager || "0"),
           lastPayout: BigInt(s.lastPayout || "0"),
           lastJackpot: BigInt(s.lastJackpot || "0"),
+          lastOutcome: s.lastOutcome == null ? null : Number(s.lastOutcome),
+          lastSpinsConsumed: s.lastSpinsConsumed == null ? null : Number(s.lastSpinsConsumed),
         });
       }
     }
@@ -294,7 +312,7 @@ function saveState() {
 }
 
 // =====================
-// SNAPSHOTS ESTÁVEIS
+// SNAPSHOTS
 // =====================
 function getStatsSnapshot() {
   return [...stats.entries()].map(([mult, s]) => ({
@@ -307,6 +325,8 @@ function getStatsSnapshot() {
     lastWager: BigInt(s.lastWager || 0n),
     lastPayout: BigInt(s.lastPayout || 0n),
     lastJackpot: BigInt(s.lastJackpot || 0n),
+    lastOutcome: s.lastOutcome == null ? null : Number(s.lastOutcome),
+    lastSpinsConsumed: s.lastSpinsConsumed == null ? null : Number(s.lastSpinsConsumed),
   }));
 }
 
@@ -324,6 +344,8 @@ function getStatSnapshotByKey(key) {
     lastWager: BigInt(s.lastWager || 0n),
     lastPayout: BigInt(s.lastPayout || 0n),
     lastJackpot: BigInt(s.lastJackpot || 0n),
+    lastOutcome: s.lastOutcome == null ? null : Number(s.lastOutcome),
+    lastSpinsConsumed: s.lastSpinsConsumed == null ? null : Number(s.lastSpinsConsumed),
   };
 }
 
@@ -336,53 +358,104 @@ const provider = new ethers.JsonRpcProvider(
   { staticNetwork: true, timeout: RPC_TIMEOUT_MS }
 );
 
+// ABI da roleta correta
 const ABI = [
   "event SpinStarted(uint256 indexed requestId,address indexed player,uint256 wager,uint256 netStake,uint256 multiplierHundredths,uint256 maxPayout,uint256 jackpotContribution,uint32 configIndex,bool participatingInJackpot)",
-  "event SpinResolved(uint256 indexed requestId,address indexed player,uint8 outcome,uint256 payout,uint8 spinsConsumed,uint256 jackpotPayout)"
+  "event SpinResolved(uint256 indexed requestId,address indexed player,uint8 outcome,uint256 payout,uint8 spinsConsumed,uint256 jackpotPayout)",
+  "event SpinFailed(uint256 indexed requestId,address indexed player,bytes32 reason)"
 ];
 
 const iface = new ethers.Interface(ABI);
 const topicStarted = iface.getEvent("SpinStarted").topicHash;
 const topicResolved = iface.getEvent("SpinResolved").topicHash;
+const topicFailed = iface.getEvent("SpinFailed").topicHash;
 
 // =====================
 // EVENTS
 // =====================
 function onSpinStarted(log) {
-  const parsed = iface.parseLog(log);
+  try {
+    const parsed = iface.parseLog(log);
 
-  startMap.set(parsed.args.requestId.toString(), {
-    mult: parsed.args.multiplierHundredths,
-    wager: parsed.args.wager,
-    player: parsed.args.player,
-  });
+    pendingMap.set(parsed.args.requestId.toString(), {
+      mult: parsed.args.multiplierHundredths,
+      wager: parsed.args.wager,
+      player: parsed.args.player,
+      netStake: parsed.args.netStake,
+      maxPayout: parsed.args.maxPayout,
+      jackpotContribution: parsed.args.jackpotContribution,
+      configIndex: parsed.args.configIndex,
+      participatingInJackpot: parsed.args.participatingInJackpot,
+      blockNumber: log.blockNumber,
+    });
+  } catch (e) {
+    console.log("Erro onSpinStarted:", e?.message || e);
+  }
+}
+
+function ensurePendingForResolved(parsed) {
+  const id = parsed.args.requestId.toString();
+  let start = pendingMap.get(id);
+
+  if (!start) {
+    // fallback para não perder o resolved se started não caiu por chunk/buraco
+    start = {
+      mult: 0,
+      wager: 0n,
+      player: parsed.args.player,
+      netStake: 0n,
+      maxPayout: 0n,
+      jackpotContribution: 0n,
+      configIndex: 0,
+      participatingInJackpot: false,
+      blockNumber: null,
+    };
+  }
+
+  return start;
 }
 
 function onSpinResolved(log) {
-  const parsed = iface.parseLog(log);
-  const id = parsed.args.requestId.toString();
-  const start = startMap.get(id);
+  try {
+    const parsed = iface.parseLog(log);
+    const id = parsed.args.requestId.toString();
+    const start = ensurePendingForResolved(parsed);
 
-  if (!start) return;
+    const mult = start.mult && Number(start.mult) > 0 ? fmtMult(start.mult) : "unknown";
+    const s = getStat(mult);
 
-  const mult = fmtMult(start.mult);
-  const s = getStat(mult);
+    s.spins++;
 
-  s.spins++;
+    if (parsed.args.payout > 0n || parsed.args.jackpotPayout > 0n) {
+      s.wins++;
+      s.loss = 0;
+      s.lastWinBlock = log.blockNumber;
+      s.lastWinner = parsed.args.player;
+      s.lastWager = start.wager || 0n;
+      s.lastPayout = parsed.args.payout || 0n;
+      s.lastJackpot = parsed.args.jackpotPayout || 0n;
+      s.lastOutcome = Number(parsed.args.outcome);
+      s.lastSpinsConsumed = Number(parsed.args.spinsConsumed);
+    } else {
+      s.loss++;
+      s.lastOutcome = Number(parsed.args.outcome);
+      s.lastSpinsConsumed = Number(parsed.args.spinsConsumed);
+    }
 
-  if (parsed.args.payout > 0n || parsed.args.jackpotPayout > 0n) {
-    s.wins++;
-    s.loss = 0;
-    s.lastWinBlock = log.blockNumber;
-    s.lastWinner = parsed.args.player;
-    s.lastWager = start.wager;
-    s.lastPayout = parsed.args.payout;
-    s.lastJackpot = parsed.args.jackpotPayout;
-  } else {
-    s.loss++;
+    pendingMap.delete(id);
+  } catch (e) {
+    console.log("Erro onSpinResolved:", e?.message || e);
   }
+}
 
-  startMap.delete(id);
+function onSpinFailed(log) {
+  try {
+    const parsed = iface.parseLog(log);
+    const id = parsed.args.requestId.toString();
+    pendingMap.delete(id);
+  } catch (e) {
+    console.log("Erro onSpinFailed:", e?.message || e);
+  }
 }
 
 function varianceRows(n = TOP_SHOW_LIMIT) {
@@ -390,11 +463,11 @@ function varianceRows(n = TOP_SHOW_LIMIT) {
   const arr = [];
 
   for (const r of snapshot) {
-    if (multNum(r.mult) < 2) continue;
-    if (r.loss < 5) continue;
-    if (r.spins < 10) continue;
+    if (r.mult === "unknown") continue;
+    if (r.spins < 1) continue;
 
     const expLoss = expectedLoss(r.mult);
+    if (!Number.isFinite(expLoss) || expLoss <= 0) continue;
 
     arr.push({
       ...r,
@@ -403,7 +476,12 @@ function varianceRows(n = TOP_SHOW_LIMIT) {
     });
   }
 
-  arr.sort((a, b) => b.score - a.score);
+  arr.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.loss !== a.loss) return b.loss - a.loss;
+    return multNum(a.mult) - multNum(b.mult);
+  });
+
   return arr.slice(0, n);
 }
 
@@ -422,8 +500,8 @@ bot.onText(/\/help/, (msg) => {
       "",
       "/best → melhores pela variância",
       "/top → maior sequência de loss",
-      "/m 30 → detalhes multiplicador",
-      "/lastwin 30 → último ganhador",
+      "/m 1.01 → detalhes multiplicador",
+      "/lastwin 1.01 → último ganhador",
       "/stats → resumo",
       "/status → andamento do scanner",
       "/chatid",
@@ -457,6 +535,8 @@ bot.onText(/\/status/, (msg) => {
       `liveNextBlock: ${liveNextBlock || "-"}`,
       `latestLiveBlock: ${latestLiveBlock || "-"}`,
       `multiplicadores: ${stats.size}`,
+      `pendentes em memória: ${pendingMap.size}`,
+      `contrato: ${CONTRACT_ADDRESS}`,
     ].join("\n")
   );
 });
@@ -470,10 +550,12 @@ bot.onText(/\/stats/, (msg) => {
 
   let spins = 0;
   let wins = 0;
+  let losses = 0;
 
   for (const v of snapshot) {
     spins += v.spins;
     wins += v.wins;
+    losses += Math.max(0, v.spins - v.wins);
   }
 
   send(
@@ -482,7 +564,8 @@ bot.onText(/\/stats/, (msg) => {
 
 multiplicadores: ${snapshot.length}
 spins: ${spins}
-wins: ${wins}`
+wins: ${wins}
+losses: ${losses}`
   );
 });
 
@@ -494,7 +577,11 @@ bot.onText(/\/top/, (msg) => {
   const snapshot = getStatsSnapshot();
 
   const arr = snapshot
-    .sort((a, b) => b.loss - a.loss)
+    .filter((r) => r.mult !== "unknown")
+    .sort((a, b) => {
+      if (b.loss !== a.loss) return b.loss - a.loss;
+      return multNum(a.mult) - multNum(b.mult);
+    })
     .slice(0, TOP_SHOW_LIMIT);
 
   if (!arr.length) {
@@ -525,7 +612,7 @@ bot.onText(/\/best/, (msg) => {
       `${i + 1}️⃣ ${r.mult}
 score: ${r.score.toFixed(2)}
 loss: ${r.loss}
-esperado: ${r.expLoss.toFixed(1)}`
+esperado: ${r.expLoss.toFixed(2)}`
     );
   });
 
@@ -537,9 +624,7 @@ bot.onText(/\/m (.+)/, (msg, match) => {
   if (!allowedChat(chatId)) return;
   if (!shouldProcessCommand(chatId, msg.text)) return;
 
-  let q = String(match[1] || "").replace(",", ".");
-  let key = q.includes("x") ? q : q + "x";
-
+  const key = normalizeMultiplierInput(match[1]);
   const s = getStatSnapshotByKey(key);
 
   if (!s) {
@@ -558,12 +643,14 @@ LOSS: ${s.loss}
 SPINS: ${s.spins}
 WINS: ${s.wins}
 
-esperado: ${exp.toFixed(1)}
-score: ${(s.loss / exp).toFixed(2)}
+esperado: ${exp.toFixed(2)}
+score: ${exp > 0 ? (s.loss / exp).toFixed(2) : "0.00"}
 
-chance dessa sequência: ${(prob * 100).toFixed(2)}%
+chance dessa sequência: ${(prob * 100).toFixed(4)}%
 
-último win: ${s.lastWinBlock || "-"}`
+último win: ${s.lastWinBlock || "-"}
+último outcome: ${s.lastOutcome ?? "-"}
+últimos spinsConsumed: ${s.lastSpinsConsumed ?? "-"}`    
   );
 });
 
@@ -572,9 +659,7 @@ bot.onText(/\/lastwin (.+)/, (msg, match) => {
   if (!allowedChat(chatId)) return;
   if (!shouldProcessCommand(chatId, msg.text)) return;
 
-  let q = String(match[1] || "").replace(",", ".");
-  let key = q.includes("x") ? q : q + "x";
-
+  const key = normalizeMultiplierInput(match[1]);
   const s = getStatSnapshotByKey(key);
 
   if (!s) {
@@ -608,7 +693,13 @@ Prêmio:
 ${payout} EVA
 
 Jackpot:
-${jackpot} EVA`
+${jackpot} EVA
+
+Outcome:
+${s.lastOutcome ?? "-"}
+
+spinsConsumed:
+${s.lastSpinsConsumed ?? "-"}`
   );
 });
 
@@ -625,15 +716,19 @@ async function getLogs(from, to, topic) {
 }
 
 async function processRange(from, to, label) {
-  const [a, b] = await Promise.all([
+  const [startedLogs, resolvedLogs, failedLogs] = await Promise.all([
     getLogs(from, to, topicStarted),
     getLogs(from, to, topicResolved),
+    getLogs(from, to, topicFailed),
   ]);
 
-  a.forEach(onSpinStarted);
-  b.forEach(onSpinResolved);
+  for (const log of startedLogs) onSpinStarted(log);
+  for (const log of resolvedLogs) onSpinResolved(log);
+  for (const log of failedLogs) onSpinFailed(log);
 
-  console.log(`${label} ${from} -> ${to}`);
+  console.log(
+    `${label} ${from} -> ${to} | started=${startedLogs.length} resolved=${resolvedLogs.length} failed=${failedLogs.length}`
+  );
 }
 
 async function withProcessingLock(fn) {
@@ -806,6 +901,7 @@ async function scanLive() {
 // =====================
 (async () => {
   console.log("🚀 scanner start");
+  console.log("📍 contrato:", CONTRACT_ADDRESS);
 
   await initializeRanges();
   await startTelegramPolling();
