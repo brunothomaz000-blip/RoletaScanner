@@ -33,6 +33,10 @@ const BLOCKS_PER_DAY = Number(process.env.BLOCKS_PER_DAY || 345600);
 const LIVE_MAX_LAG_BLOCKS = Number(process.env.LIVE_MAX_LAG_BLOCKS || 2000000);
 const TOP_SHOW_LIMIT = Number(process.env.TOP_SHOW_LIMIT || 25);
 
+const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 20);
+const FAILS_LIMIT = Number(process.env.FAILS_LIMIT || 20);
+const ALERT_COOLDOWN_MS = Number(process.env.ALERT_COOLDOWN_MS || 15 * 60 * 1000);
+
 if (!TELEGRAM_BOT_TOKEN) throw new Error("Faltou TELEGRAM_BOT_TOKEN");
 if (!RPC_URL) throw new Error("Faltou RPC_URL");
 if (!CONTRACT_ADDRESS) throw new Error("Faltou CONTRACT_ADDRESS");
@@ -110,6 +114,26 @@ function normalizeMultiplierInput(input) {
   return fmtMult(Math.round(num * 100)).toLowerCase();
 }
 
+function sortByLossDesc(a, b) {
+  if (b.loss !== a.loss) return b.loss - a.loss;
+  return multNum(a.mult) - multNum(b.mult);
+}
+
+function sortByLastWinDesc(a, b) {
+  const av = Number(a.lastWinBlock || 0);
+  const bv = Number(b.lastWinBlock || 0);
+  return bv - av;
+}
+
+function nowTs() {
+  return Date.now();
+}
+
+function truncate(str, max = 4000) {
+  const s = String(str || "");
+  return s.length <= max ? s : s.slice(0, max - 3) + "...";
+}
+
 // =====================
 // TELEGRAM
 // =====================
@@ -135,11 +159,20 @@ function shouldProcessCommand(chatId, text, windowMs = 2500) {
 }
 
 function send(chatId, text) {
-  return bot.sendMessage(chatId, text, {
+  return bot.sendMessage(chatId, truncate(text), {
     disable_web_page_preview: true,
   }).catch((e) => {
     console.log("send error:", e?.message || e);
   });
+}
+
+async function broadcastAllowed(text) {
+  const ids = TELEGRAM_ALLOWED_CHAT_IDS.length
+    ? TELEGRAM_ALLOWED_CHAT_IDS
+    : [];
+  for (const chatId of ids) {
+    await send(chatId, text);
+  }
 }
 
 async function startTelegramPolling() {
@@ -202,6 +235,9 @@ bot.on("polling_error", async (err) => {
 // =====================
 const stats = new Map();
 const pendingMap = new Map();
+const recentResolved = [];
+const recentFails = [];
+const alerts = new Map();
 
 let historicalRunning = false;
 let historicalFinished = false;
@@ -234,6 +270,7 @@ function getStat(mult) {
       lastJackpot: 0n,
       lastOutcome: null,
       lastSpinsConsumed: null,
+      updatedAt: null,
     });
   }
   return stats.get(mult);
@@ -247,6 +284,19 @@ function serializeStats() {
       lastWager: String(s.lastWager || 0n),
       lastPayout: String(s.lastPayout || 0n),
       lastJackpot: String(s.lastJackpot || 0n),
+    };
+  }
+  return out;
+}
+
+function serializeAlerts() {
+  const out = {};
+  for (const [mult, a] of alerts.entries()) {
+    out[mult] = {
+      mult: a.mult,
+      minLoss: Number(a.minLoss || 0),
+      createdAt: Number(a.createdAt || 0),
+      lastTriggeredAt: Number(a.lastTriggeredAt || 0),
     };
   }
   return out;
@@ -281,6 +331,18 @@ function loadState() {
           lastJackpot: BigInt(s.lastJackpot || "0"),
           lastOutcome: s.lastOutcome == null ? null : Number(s.lastOutcome),
           lastSpinsConsumed: s.lastSpinsConsumed == null ? null : Number(s.lastSpinsConsumed),
+          updatedAt: s.updatedAt == null ? null : Number(s.updatedAt),
+        });
+      }
+    }
+
+    if (data.alerts && typeof data.alerts === "object") {
+      for (const [mult, a] of Object.entries(data.alerts)) {
+        alerts.set(mult, {
+          mult,
+          minLoss: Number(a.minLoss || 0),
+          createdAt: Number(a.createdAt || 0),
+          lastTriggeredAt: Number(a.lastTriggeredAt || 0),
         });
       }
     }
@@ -303,6 +365,7 @@ function saveState() {
       latestLiveBlock,
       latestChainHead,
       stats: serializeStats(),
+      alerts: serializeAlerts(),
     };
 
     fs.writeFileSync(STATE_FILE, JSON.stringify(payload, null, 2));
@@ -327,6 +390,7 @@ function getStatsSnapshot() {
     lastJackpot: BigInt(s.lastJackpot || 0n),
     lastOutcome: s.lastOutcome == null ? null : Number(s.lastOutcome),
     lastSpinsConsumed: s.lastSpinsConsumed == null ? null : Number(s.lastSpinsConsumed),
+    updatedAt: s.updatedAt == null ? null : Number(s.updatedAt),
   }));
 }
 
@@ -346,7 +410,47 @@ function getStatSnapshotByKey(key) {
     lastJackpot: BigInt(s.lastJackpot || 0n),
     lastOutcome: s.lastOutcome == null ? null : Number(s.lastOutcome),
     lastSpinsConsumed: s.lastSpinsConsumed == null ? null : Number(s.lastSpinsConsumed),
+    updatedAt: s.updatedAt == null ? null : Number(s.updatedAt),
   };
+}
+
+// =====================
+// RECENT BUFFERS
+// =====================
+function pushRecentResolved(item) {
+  recentResolved.unshift(item);
+  if (recentResolved.length > RECENT_LIMIT) recentResolved.length = RECENT_LIMIT;
+}
+
+function pushRecentFail(item) {
+  recentFails.unshift(item);
+  if (recentFails.length > FAILS_LIMIT) recentFails.length = FAILS_LIMIT;
+}
+
+// =====================
+// ALERTS
+// =====================
+async function checkAlertsFor(mult, stat) {
+  const a = alerts.get(mult);
+  if (!a) return;
+  if (stat.loss < a.minLoss) return;
+
+  const lastTriggeredAt = Number(a.lastTriggeredAt || 0);
+  if (nowTs() - lastTriggeredAt < ALERT_COOLDOWN_MS) return;
+
+  a.lastTriggeredAt = nowTs();
+  saveState();
+
+  await broadcastAllowed(
+    [
+      "🚨 ALERTA DISPARADO",
+      `${mult} atingiu ${stat.loss} LOSS`,
+      `mínimo configurado: ${a.minLoss}`,
+      `spins: ${stat.spins}`,
+      `wins: ${stat.wins}`,
+      `score: ${varianceScore(mult, stat.loss).toFixed(2)}`,
+    ].join("\n")
+  );
 }
 
 // =====================
@@ -358,7 +462,6 @@ const provider = new ethers.JsonRpcProvider(
   { staticNetwork: true, timeout: RPC_TIMEOUT_MS }
 );
 
-// ABI da roleta correta
 const ABI = [
   "event SpinStarted(uint256 indexed requestId,address indexed player,uint256 wager,uint256 netStake,uint256 multiplierHundredths,uint256 maxPayout,uint256 jackpotContribution,uint32 configIndex,bool participatingInJackpot)",
   "event SpinResolved(uint256 indexed requestId,address indexed player,uint8 outcome,uint256 payout,uint8 spinsConsumed,uint256 jackpotPayout)",
@@ -387,18 +490,18 @@ function onSpinStarted(log) {
       configIndex: parsed.args.configIndex,
       participatingInJackpot: parsed.args.participatingInJackpot,
       blockNumber: log.blockNumber,
+      txHash: log.transactionHash,
     });
   } catch (e) {
     console.log("Erro onSpinStarted:", e?.message || e);
   }
 }
 
-function ensurePendingForResolved(parsed) {
+function ensurePendingForResolved(parsed, log) {
   const id = parsed.args.requestId.toString();
   let start = pendingMap.get(id);
 
   if (!start) {
-    // fallback para não perder o resolved se started não caiu por chunk/buraco
     start = {
       mult: 0,
       wager: 0n,
@@ -409,24 +512,28 @@ function ensurePendingForResolved(parsed) {
       configIndex: 0,
       participatingInJackpot: false,
       blockNumber: null,
+      txHash: log?.transactionHash || null,
     };
   }
 
   return start;
 }
 
-function onSpinResolved(log) {
+async function onSpinResolved(log) {
   try {
     const parsed = iface.parseLog(log);
     const id = parsed.args.requestId.toString();
-    const start = ensurePendingForResolved(parsed);
+    const start = ensurePendingForResolved(parsed, log);
 
     const mult = start.mult && Number(start.mult) > 0 ? fmtMult(start.mult) : "unknown";
     const s = getStat(mult);
 
     s.spins++;
+    s.updatedAt = nowTs();
 
-    if (parsed.args.payout > 0n || parsed.args.jackpotPayout > 0n) {
+    const isWin = parsed.args.payout > 0n || parsed.args.jackpotPayout > 0n;
+
+    if (isWin) {
       s.wins++;
       s.loss = 0;
       s.lastWinBlock = log.blockNumber;
@@ -442,7 +549,23 @@ function onSpinResolved(log) {
       s.lastSpinsConsumed = Number(parsed.args.spinsConsumed);
     }
 
+    pushRecentResolved({
+      requestId: id,
+      blockNumber: log.blockNumber,
+      txHash: log.transactionHash,
+      mult,
+      player: parsed.args.player,
+      wager: start.wager || 0n,
+      payout: parsed.args.payout || 0n,
+      jackpotPayout: parsed.args.jackpotPayout || 0n,
+      outcome: Number(parsed.args.outcome),
+      spinsConsumed: Number(parsed.args.spinsConsumed),
+      isWin,
+      at: nowTs(),
+    });
+
     pendingMap.delete(id);
+    await checkAlertsFor(mult, s);
   } catch (e) {
     console.log("Erro onSpinResolved:", e?.message || e);
   }
@@ -452,6 +575,16 @@ function onSpinFailed(log) {
   try {
     const parsed = iface.parseLog(log);
     const id = parsed.args.requestId.toString();
+
+    pushRecentFail({
+      requestId: id,
+      blockNumber: log.blockNumber,
+      txHash: log.transactionHash,
+      player: parsed.args.player,
+      reason: parsed.args.reason,
+      at: nowTs(),
+    });
+
     pendingMap.delete(id);
   } catch (e) {
     console.log("Erro onSpinFailed:", e?.message || e);
@@ -502,6 +635,14 @@ bot.onText(/\/help/, (msg) => {
       "/top → maior sequência de loss",
       "/m 1.01 → detalhes multiplicador",
       "/lastwin 1.01 → último ganhador",
+      "/recent → últimos resultados",
+      "/hot → mais atrasados pela variância",
+      "/cold → últimos que bateram win",
+      "/fails → últimas falhas",
+      "/range 1.01 2.00 → faixa de multiplicadores",
+      "/alert 1.50 12 → alerta quando LOSS >= 12",
+      "/alerts → listar alertas",
+      "/unalert 1.50 → remover alerta",
       "/stats → resumo",
       "/status → andamento do scanner",
       "/chatid",
@@ -536,6 +677,9 @@ bot.onText(/\/status/, (msg) => {
       `latestLiveBlock: ${latestLiveBlock || "-"}`,
       `multiplicadores: ${stats.size}`,
       `pendentes em memória: ${pendingMap.size}`,
+      `recent resolved: ${recentResolved.length}`,
+      `recent fails: ${recentFails.length}`,
+      `alertas ativos: ${alerts.size}`,
       `contrato: ${CONTRACT_ADDRESS}`,
     ].join("\n")
   );
@@ -578,10 +722,7 @@ bot.onText(/\/top/, (msg) => {
 
   const arr = snapshot
     .filter((r) => r.mult !== "unknown")
-    .sort((a, b) => {
-      if (b.loss !== a.loss) return b.loss - a.loss;
-      return multNum(a.mult) - multNum(b.mult);
-    })
+    .sort(sortByLossDesc)
     .slice(0, TOP_SHOW_LIMIT);
 
   if (!arr.length) {
@@ -619,6 +760,93 @@ esperado: ${r.expLoss.toFixed(2)}`
   send(chatId, lines.join("\n\n"));
 });
 
+bot.onText(/\/hot/, (msg) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+  if (!shouldProcessCommand(chatId, msg.text)) return;
+
+  const rows = varianceRows(TOP_SHOW_LIMIT);
+
+  if (!rows.length) {
+    send(chatId, "Sem dados suficientes ainda.");
+    return;
+  }
+
+  const lines = ["🌡️ HOT — MAIS ATRASADOS", ""];
+  rows.forEach((r, i) => {
+    lines.push(
+      `${i + 1}️⃣ ${r.mult} | loss=${r.loss} | score=${r.score.toFixed(2)} | exp=${r.expLoss.toFixed(2)}`
+    );
+  });
+
+  send(chatId, lines.join("\n"));
+});
+
+bot.onText(/\/cold/, (msg) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+  if (!shouldProcessCommand(chatId, msg.text)) return;
+
+  const arr = getStatsSnapshot()
+    .filter((r) => r.mult !== "unknown" && r.lastWinBlock)
+    .sort(sortByLastWinDesc)
+    .slice(0, TOP_SHOW_LIMIT);
+
+  if (!arr.length) {
+    send(chatId, "Nenhum win registrado ainda.");
+    return;
+  }
+
+  const lines = ["🧊 COLD — ÚLTIMOS QUE BATERAM WIN", ""];
+  arr.forEach((r, i) => {
+    lines.push(
+      `${i + 1}️⃣ ${r.mult} | bloco=${r.lastWinBlock} | payout=${formatTokenAmount(r.lastPayout)} EVA`
+    );
+  });
+
+  send(chatId, lines.join("\n"));
+});
+
+bot.onText(/\/recent/, (msg) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+  if (!shouldProcessCommand(chatId, msg.text)) return;
+
+  if (!recentResolved.length) {
+    send(chatId, "Ainda não há resultados recentes em memória.");
+    return;
+  }
+
+  const lines = ["🕒 ÚLTIMOS RESULTADOS", ""];
+  recentResolved.slice(0, RECENT_LIMIT).forEach((r, i) => {
+    lines.push(
+      `${i + 1}️⃣ ${r.mult} | ${r.isWin ? "WIN" : "LOSS"} | payout=${formatTokenAmount(r.payout)} EVA | jackpot=${formatTokenAmount(r.jackpotPayout)} EVA | bloco=${r.blockNumber}`
+    );
+  });
+
+  send(chatId, lines.join("\n"));
+});
+
+bot.onText(/\/fails/, (msg) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+  if (!shouldProcessCommand(chatId, msg.text)) return;
+
+  if (!recentFails.length) {
+    send(chatId, "Nenhuma falha recente em memória.");
+    return;
+  }
+
+  const lines = ["⚠️ ÚLTIMAS FALHAS", ""];
+  recentFails.slice(0, FAILS_LIMIT).forEach((r, i) => {
+    lines.push(
+      `${i + 1}️⃣ bloco=${r.blockNumber} | player=${r.player} | requestId=${r.requestId}`
+    );
+  });
+
+  send(chatId, lines.join("\n"));
+});
+
 bot.onText(/\/m (.+)/, (msg, match) => {
   const chatId = msg.chat.id;
   if (!allowedChat(chatId)) return;
@@ -650,7 +878,7 @@ chance dessa sequência: ${(prob * 100).toFixed(4)}%
 
 último win: ${s.lastWinBlock || "-"}
 último outcome: ${s.lastOutcome ?? "-"}
-últimos spinsConsumed: ${s.lastSpinsConsumed ?? "-"}`    
+últimos spinsConsumed: ${s.lastSpinsConsumed ?? "-"}`
   );
 });
 
@@ -703,6 +931,109 @@ ${s.lastSpinsConsumed ?? "-"}`
   );
 });
 
+bot.onText(/\/range ([^\s]+)\s+([^\s]+)/, (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+  if (!shouldProcessCommand(chatId, msg.text)) return;
+
+  const a = multNum(normalizeMultiplierInput(match[1]));
+  const b = multNum(normalizeMultiplierInput(match[2]));
+
+  if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) {
+    send(chatId, "faixa inválida");
+    return;
+  }
+
+  const min = Math.min(a, b);
+  const max = Math.max(a, b);
+
+  const arr = getStatsSnapshot()
+    .filter((r) => {
+      if (r.mult === "unknown") return false;
+      const m = multNum(r.mult);
+      return Number.isFinite(m) && m >= min && m <= max;
+    })
+    .sort((x, y) => {
+      const xs = varianceScore(x.mult, x.loss);
+      const ys = varianceScore(y.mult, y.loss);
+      if (ys !== xs) return ys - xs;
+      return y.loss - x.loss;
+    })
+    .slice(0, TOP_SHOW_LIMIT);
+
+  if (!arr.length) {
+    send(chatId, "nenhum multiplicador nessa faixa");
+    return;
+  }
+
+  const lines = [`📐 RANGE ${min.toFixed(2)}x até ${max.toFixed(2)}x`, ""];
+  arr.forEach((r, i) => {
+    const exp = expectedLoss(r.mult);
+    const score = varianceScore(r.mult, r.loss);
+    lines.push(
+      `${i + 1}️⃣ ${r.mult} | loss=${r.loss} | score=${score.toFixed(2)} | exp=${exp.toFixed(2)}`
+    );
+  });
+
+  send(chatId, lines.join("\n"));
+});
+
+bot.onText(/\/alert ([^\s]+)\s+(\d+)/, (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+  if (!shouldProcessCommand(chatId, msg.text)) return;
+
+  const mult = normalizeMultiplierInput(match[1]);
+  const minLoss = Number(match[2]);
+
+  if (!mult || !Number.isFinite(minLoss) || minLoss < 1) {
+    send(chatId, "uso: /alert 1.50 12");
+    return;
+  }
+
+  alerts.set(mult, {
+    mult,
+    minLoss,
+    createdAt: nowTs(),
+    lastTriggeredAt: 0,
+  });
+
+  saveState();
+  send(chatId, `✅ alerta criado para ${mult} quando LOSS >= ${minLoss}`);
+});
+
+bot.onText(/\/alerts/, (msg) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+  if (!shouldProcessCommand(chatId, msg.text)) return;
+
+  if (!alerts.size) {
+    send(chatId, "nenhum alerta ativo");
+    return;
+  }
+
+  const lines = ["🔔 ALERTAS ATIVOS", ""];
+  let i = 1;
+  for (const a of alerts.values()) {
+    lines.push(`${i}️⃣ ${a.mult} | loss mínimo=${a.minLoss}`);
+    i++;
+  }
+
+  send(chatId, lines.join("\n"));
+});
+
+bot.onText(/\/unalert (.+)/, (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+  if (!shouldProcessCommand(chatId, msg.text)) return;
+
+  const mult = normalizeMultiplierInput(match[1]);
+  const ok = alerts.delete(mult);
+  saveState();
+
+  send(chatId, ok ? `🗑️ alerta removido de ${mult}` : "alerta não encontrado");
+});
+
 // =====================
 // RPC
 // =====================
@@ -723,11 +1054,11 @@ async function processRange(from, to, label) {
   ]);
 
   for (const log of startedLogs) onSpinStarted(log);
-  for (const log of resolvedLogs) onSpinResolved(log);
+  for (const log of resolvedLogs) await onSpinResolved(log);
   for (const log of failedLogs) onSpinFailed(log);
 
   console.log(
-    `${label} ${from} -> ${to} | started=${startedLogs.length} resolved=${resolvedLogs.length} failed=${failedLogs.length}`
+    `${label} ${from} -> ${to} | iniciado=${startedLogs.length} resolvido=${resolvedLogs.length} falhou=${failedLogs.length}`
   );
 }
 
