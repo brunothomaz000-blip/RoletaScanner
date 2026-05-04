@@ -548,7 +548,7 @@ async function onSpinResolved(log) {
     s.spins++;
     s.updatedAt = nowTs();
 
-    const isWin = parsed.args.payout > 0n || parsed.args.jackpotPayout > 0n;
+    const isWin = parsed.args.outcome === 1;
 
     if (isWin) {
       seq.history.push(seq.currentLoss);
