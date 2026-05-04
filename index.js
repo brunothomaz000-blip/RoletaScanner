@@ -244,27 +244,11 @@ function getSeq(mult) {
   if (!seqMap.has(mult)) {
     seqMap.set(mult, {
       currentLoss: 0,
-      history: []
+      history: [],
     });
   }
   return seqMap.get(mult);
 }
-
-// =====================
-// SEQUÊNCIAS (NOVO)
-// =====================
-const seqMap = new Map();
-
-function getSeq(mult) {
-  if (!seqMap.has(mult)) {
-    seqMap.set(mult, {
-      currentLoss: 0,
-      history: []
-    });
-  }
-  return seqMap.get(mult);
-}
-
 const pendingMap = new Map();
 const recentResolved = [];
 const recentFails = [];
@@ -557,7 +541,6 @@ async function onSpinResolved(log) {
     const start = ensurePendingForResolved(parsed, log);
 
     const mult = start.mult && Number(start.mult) > 0 ? fmtMult(start.mult) : "unknown";
-    const seq = getSeq(mult);
     const s = getStat(mult);
     const seq = getSeq(mult);
 
@@ -567,9 +550,6 @@ async function onSpinResolved(log) {
     const isWin = parsed.args.payout > 0n || parsed.args.jackpotPayout > 0n;
 
     if (isWin) {
-      seq.history.push(seq.currentLoss);
-      if (seq.history.length > 200) seq.history.shift();
-      seq.currentLoss = 0;
       seq.history.push(seq.currentLoss);
       if (seq.history.length > 200) seq.history.shift();
       seq.currentLoss = 0;
@@ -1074,6 +1054,44 @@ bot.onText(/\/unalert (.+)/, (msg, match) => {
   send(chatId, ok ? `🗑️ alerta removido de ${mult}` : "alerta não encontrado");
 });
 
+
+bot.onText(/\/seq(?: (.+))?/, (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!allowedChat(chatId)) return;
+  if (!shouldProcessCommand(chatId, msg.text)) return;
+
+  const alvoInput = match[1];
+
+  let texto = "📊 SEQUÊNCIAS\n";
+
+  const multiplicadores = [
+    "1.10x", "1.30x", "1.50x", "2x", "3x", "4x", "5x",
+    "6x", "7x", "8x", "9x", "10x", "30x", "100x"
+  ];
+
+  const lista = alvoInput
+    ? [normalizeMultiplierInput(alvoInput)]
+    : multiplicadores;
+
+  for (const mult of lista) {
+    const seq = seqMap.get(mult);
+
+    if (!seq || !seq.history.length) {
+      texto += `\n${mult}\nSem dados ainda\n`;
+      continue;
+    }
+
+    const ultimas = seq.history.slice(-15);
+
+    texto += `\n🎯 ${mult}\n`;
+    texto += ultimas.map((v) => `${v}L-1W`).join(", ");
+    texto += `\nMaior: ${Math.max(...seq.history)}\n`;
+    texto += `Atual: ${seq.currentLoss}\n`;
+  }
+
+  send(chatId, texto);
+});
+
 // =====================
 // RPC
 // =====================
@@ -1189,7 +1207,6 @@ async function scanHistorical() {
         if (historicalCursor === from) {
           historicalCursor = to + 1;
         } else {
-      seq.currentLoss++;
           console.log(`⚠️ histórico não avançado porque cursor mudou. atual=${historicalCursor}`);
         }
 
@@ -1267,85 +1284,6 @@ async function scanLive() {
     liveRunning = false;
   }
 }
-
-
-bot.onText(/\/seq(?: (.+))?/, (msg, match) => {
-  const chatId = msg.chat.id;
-  if (!allowedChat(chatId)) return;
-  if (!shouldProcessCommand(chatId, msg.text)) return;
-
-  const alvoInput = match[1];
-
-  let texto = "📊 SEQUÊNCIAS\n";
-
-  const multiplicadores = [
-    "1.10x","1.30x","1.50x","2x","3x","4x","5x",
-    "6x","7x","8x","9x","10x","30x","100x"
-  ];
-
-  const lista = alvoInput
-    ? [normalizeMultiplierInput(alvoInput)]
-    : multiplicadores;
-
-  for (const mult of lista) {
-    const seq = seqMap.get(mult);
-
-    if (!seq || !seq.history.length) {
-      texto += `\n${mult}\nSem dados ainda\n`;
-      continue;
-    }
-
-    const ultimas = seq.history.slice(-15);
-
-    texto += `\n🎯 ${mult}\n`;
-    texto += ultimas.map(v => `${v}L-1W`).join(", ");
-    texto += `\nMaior: ${Math.max(...seq.history)}\n`;
-    texto += `Atual: ${seq.currentLoss}\n`;
-  }
-
-  send(chatId, texto);
-});
-
-
-// =====================
-// CMD SEQ (ADICIONADO)
-// =====================
-bot.onText(/\/seq(?: (.+))?/, (msg, match) => {
-  const chatId = msg.chat.id;
-  if (!allowedChat(chatId)) return;
-  if (!shouldProcessCommand(chatId, msg.text)) return;
-
-  const alvoInput = match[1];
-
-  let texto = "📊 SEQUÊNCIAS\n";
-
-  const multiplicadores = [
-    "1.10x","1.30x","1.50x","2x","3x","4x","5x",
-    "6x","7x","8x","9x","10x","30x","100x"
-  ];
-
-  const lista = alvoInput
-    ? [normalizeMultiplierInput(alvoInput)]
-    : multiplicadores;
-
-  for (const mult of lista) {
-    const seq = seqMap.get(mult);
-
-    if (!seq || !seq.history.length) {
-      texto += `\n${mult}\nSem dados ainda\n`;
-      continue;
-    }
-
-    const ultimas = seq.history.slice(-15);
-
-    texto += `\n🎯 ${mult}\n`;
-    texto += ultimas.map(v => `${v}L-1W`).join(", ");
-    texto += `\nMaior: ${Math.max(...seq.history)}\n`;
-    texto += `Atual: ${seq.currentLoss}\n`;
-  }
-
-  send(chatId, texto);
-});
 
 // =====================
 // START
