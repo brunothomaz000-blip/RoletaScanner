@@ -547,7 +547,7 @@ async function onSpinResolved(log) {
     s.spins++;
     s.updatedAt = nowTs();
 
-    const isWin = parsed.args.payout > 0n || parsed.args.jackpotPayout > 0n;
+    const isWin = parsed.args.payout > 0n;
 
     if (isWin) {
       seq.history.push(seq.currentLoss);
@@ -890,6 +890,7 @@ bot.onText(/\/m (.+)/, (msg, match) => {
 LOSS: ${s.loss}
 SPINS: ${s.spins}
 WINS: ${s.wins}
+% REAL: ${s.spins > 0 ? ((s.wins / s.spins) * 100).toFixed(4) : "0.0000"}%
 
 esperado: ${exp.toFixed(2)}
 score: ${exp > 0 ? (s.loss / exp).toFixed(2) : "0.00"}
@@ -991,7 +992,7 @@ bot.onText(/\/range ([^\s]+)\s+([^\s]+)/, (msg, match) => {
     const exp = expectedLoss(r.mult);
     const score = varianceScore(r.mult, r.loss);
     lines.push(
-      `${i + 1}️⃣ ${r.mult} | loss=${r.loss} | score=${score.toFixed(2)} | exp=${exp.toFixed(2)}`
+      `${i + 1}️⃣ ${r.mult} | loss=${r.loss} | win%=${r.spins > 0 ? ((r.wins / r.spins) * 100).toFixed(4) : "0.0000"}% | score=${score.toFixed(2)} | exp=${exp.toFixed(2)}`
     );
   });
 
