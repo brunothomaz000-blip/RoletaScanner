@@ -564,7 +564,6 @@ async function onSpinResolved(log) {
       s.lastOutcome = Number(parsed.args.outcome);
       s.lastSpinsConsumed = Number(parsed.args.spinsConsumed);
     } else {
-      seq.currentLoss++;
       s.loss++;
       s.lastOutcome = Number(parsed.args.outcome);
       s.lastSpinsConsumed = Number(parsed.args.spinsConsumed);
@@ -1170,7 +1169,6 @@ async function scanHistorical() {
         if (historicalCursor === from) {
           historicalCursor = to + 1;
         } else {
-      seq.currentLoss++;
           console.log(`⚠️ histórico não avançado porque cursor mudou. atual=${historicalCursor}`);
         }
 
