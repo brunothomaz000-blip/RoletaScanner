@@ -1081,11 +1081,15 @@ bot.onText(/\/seq(?: (.+))?/, (msg, match) => {
       continue;
     }
 
-    const ultimas = seq.history.slice(-15);
+    const ultimas = seq.history.slice(-50);
 
     texto += `\n🎯 ${mult}\n`;
     texto += ultimas.map((v) => `${v}L-1W`).join(", ");
-    texto += `\nMaior: ${Math.max(...seq.history)}\n`;
+    const maior = seq.history.length ? Math.max(...seq.history) : 0;
+    const menor = seq.history.length ? Math.min(...seq.history) : 0;
+
+    texto += `\nMaior: ${maior}\n`;
+    texto += `Menor: ${menor}\n`;
     texto += `Atual: ${seq.currentLoss}\n`;
   }
 
